@@ -1,7 +1,8 @@
 [package]
 name = "queuey"
 description = "Type-safe, macro-configured job queues on RabbitMQ with exponential backoff"
-version.workspace = true
+# Bumped independently of the workspace: only the facade changed (README).
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
