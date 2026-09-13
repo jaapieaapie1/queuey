@@ -1,0 +1,52 @@
+error[E0271]: type mismatch resolving `<BuildReport as Job>::Queue == AppQueues`
+  --> tests/compile_fail/enqueue_foreign_job.rs:35:22
+   |
+35 |     producer.enqueue(&BuildReport { id: 1 }).await.unwrap();
+   |              ------- ^^^^^^^^^^^^^^^^^^^^^^ type mismatch resolving `<BuildReport as Job>::Queue == AppQueues`
+   |              |
+   |              required by a bound introduced by this call
+   |
+note: expected this to be `AppQueues`
+  --> tests/compile_fail/enqueue_foreign_job.rs:25:15
+   |
+25 | #[job(queue = OtherQueues::Reports)]
+   |               ^^^^^^^^^^^
+note: required by a bound in `queuey::Producer::<Q, B>::enqueue`
+  --> $WORKSPACE/crates/core/src/producer.rs
+   |
+   |     pub async fn enqueue<J: Job<Queue = Q>>(&self, job: &J) -> Result<uuid::Uuid> {
+   |                                 ^^^^^^^^^ required by this bound in `Producer::<Q, B>::enqueue`
+
+error[E0271]: type mismatch resolving `<BuildReport as Job>::Queue == AppQueues`
+  --> tests/compile_fail/enqueue_foreign_job.rs:35:5
+   |
+35 |     producer.enqueue(&BuildReport { id: 1 }).await.unwrap();
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ type mismatch resolving `<BuildReport as Job>::Queue == AppQueues`
+   |
+note: expected this to be `AppQueues`
+  --> tests/compile_fail/enqueue_foreign_job.rs:25:15
+   |
+25 | #[job(queue = OtherQueues::Reports)]
+   |               ^^^^^^^^^^^
+note: required by a bound in `queuey::Producer::<Q, B>::enqueue`
+  --> $WORKSPACE/crates/core/src/producer.rs
+   |
+   |     pub async fn enqueue<J: Job<Queue = Q>>(&self, job: &J) -> Result<uuid::Uuid> {
+   |                                 ^^^^^^^^^ required by this bound in `Producer::<Q, B>::enqueue`
+
+error[E0271]: type mismatch resolving `<BuildReport as Job>::Queue == AppQueues`
+  --> tests/compile_fail/enqueue_foreign_job.rs:35:46
+   |
+35 |     producer.enqueue(&BuildReport { id: 1 }).await.unwrap();
+   |                                              ^^^^^ type mismatch resolving `<BuildReport as Job>::Queue == AppQueues`
+   |
+note: expected this to be `AppQueues`
+  --> tests/compile_fail/enqueue_foreign_job.rs:25:15
+   |
+25 | #[job(queue = OtherQueues::Reports)]
+   |               ^^^^^^^^^^^
+note: required by a bound in `queuey::Producer::<Q, B>::enqueue`
+  --> $WORKSPACE/crates/core/src/producer.rs
+   |
+   |     pub async fn enqueue<J: Job<Queue = Q>>(&self, job: &J) -> Result<uuid::Uuid> {
+   |                                 ^^^^^^^^^ required by this bound in `Producer::<Q, B>::enqueue`

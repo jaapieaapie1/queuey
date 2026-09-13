@@ -1,0 +1,5 @@
+error: `queue` must be a path to an enum variant such as `AppQueues::Emails`
+ --> tests/ui/job_single_segment_queue.rs:5:15
+  |
+5 | #[job(queue = Emails)]
+  |               ^^^^^^

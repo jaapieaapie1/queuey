@@ -1,0 +1,5 @@
+error: #[derive(Job)] requires `#[job(queue = MyQueues::Variant)]`
+ --> tests/ui/job_missing_queue.rs:5:1
+  |
+5 | #[job(name = "send_email")]
+  | ^

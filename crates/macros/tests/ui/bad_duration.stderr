@@ -1,0 +1,5 @@
+error: invalid duration `30 fortnights`: expected an integer with an optional unit (`ms`, `s`, `m`, `h`, `d`), for example "500ms", "30s" or "2m"
+ --> tests/ui/bad_duration.rs:5:27
+  |
+5 |     #[queue(message_ttl = "30 fortnights")]
+  |                           ^^^^^^^^^^^^^^^

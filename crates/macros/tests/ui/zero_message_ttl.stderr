@@ -1,0 +1,5 @@
+error: `message_ttl` must be greater than zero: a zero TTL discards every message the moment it is published
+ --> tests/ui/zero_message_ttl.rs:5:27
+  |
+5 |     #[queue(message_ttl = "0s")]
+  |                           ^^^^

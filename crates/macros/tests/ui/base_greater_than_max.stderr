@@ -1,0 +1,5 @@
+error: `base` must be <= `max`
+ --> tests/ui/base_greater_than_max.rs:5:44
+  |
+5 |     #[queue(retry(backoff = "exponential", base = "10s", max = "1s"))]
+  |                                            ^^^^

@@ -1,0 +1,5 @@
+error: #[derive(Queues)] requires at least one variant
+ --> tests/ui/empty_enum.rs:4:6
+  |
+4 | enum AppQueues {}
+  |      ^^^^^^^^^

@@ -1,0 +1,21 @@
+error[E0271]: type mismatch resolving `<BuildReport as Job>::Queue == AppQueues`
+  --> tests/compile_fail/register_foreign_handler.rs:55:18
+   |
+55 |         .handler(ReportHandler)
+   |          ------- ^^^^^^^^^^^^^ type mismatch resolving `<BuildReport as Job>::Queue == AppQueues`
+   |          |
+   |          required by a bound introduced by this call
+   |
+note: expected this to be `AppQueues`
+  --> tests/compile_fail/register_foreign_handler.rs:25:15
+   |
+25 | #[job(queue = OtherQueues::Reports)]
+   |               ^^^^^^^^^^^
+note: required by a bound in `WorkerBuilder::<Q, B>::handler`
+  --> $WORKSPACE/crates/core/src/worker.rs
+   |
+   |     pub fn handler<H>(mut self, handler: H) -> Self
+   |            ------- required by a bound in this associated function
+...
+   |         H::Job: Job<Queue = Q>,
+   |                     ^^^^^^^^^ required by this bound in `WorkerBuilder::<Q, B>::handler`

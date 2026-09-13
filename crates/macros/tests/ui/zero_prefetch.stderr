@@ -1,0 +1,5 @@
+error: `prefetch = 0` means unlimited in AMQP; omit the attribute or use a positive value
+ --> tests/ui/zero_prefetch.rs:5:13
+  |
+5 |     #[queue(prefetch = 0)]
+  |             ^^^^^^^^^^^^

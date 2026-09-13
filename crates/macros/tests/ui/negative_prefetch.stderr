@@ -1,0 +1,5 @@
+error: `prefetch` must be an integer between 1 and 65535
+ --> tests/ui/negative_prefetch.rs:5:24
+  |
+5 |     #[queue(prefetch = -1)]
+  |                        ^

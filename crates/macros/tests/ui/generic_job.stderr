@@ -1,0 +1,5 @@
+error: generic job types are not supported
+  --> tests/ui/generic_job.rs:11:17
+   |
+11 | struct SendEmail<T> {
+   |                 ^

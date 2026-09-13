@@ -1,0 +1,5 @@
+error: queue variants must not have fields
+ --> tests/ui/variant_with_fields.rs:8:11
+  |
+8 |     Images(String),
+  |           ^^^^^^^^

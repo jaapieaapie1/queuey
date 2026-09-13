@@ -1,0 +1,5 @@
+error: `prefix` must not be empty
+ --> tests/ui/empty_prefix.rs:4:19
+  |
+4 | #[queues(prefix = "")]
+  |                   ^^

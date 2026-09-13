@@ -1,0 +1,32 @@
+[package]
+name = "queuey"
+description = "Type-safe, macro-configured job queues on RabbitMQ with exponential backoff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["rabbitmq"]
+rabbitmq = ["dep:queuey-rabbitmq"]
+
+[dependencies]
+queuey-core.workspace = true
+queuey-macros.workspace = true
+queuey-rabbitmq = { workspace = true, optional = true }
+serde.workspace = true
+async-trait.workspace = true
+
+# NOTE: `queuey-core` is *not* a dev-dependency on purpose. The tests and
+# examples see exactly what a downstream user sees, only this facade, which is what
+# exercises the derive macros' path resolution (`::queuey::__core`).
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+trybuild.workspace = true
+
+[[example]]
+name = "rabbitmq_end_to_end"
+required-features = ["rabbitmq"]

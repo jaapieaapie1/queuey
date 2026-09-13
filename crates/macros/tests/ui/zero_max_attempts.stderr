@@ -1,0 +1,5 @@
+error: `max_attempts` must be >= 1; 1 means no retries
+ --> tests/ui/zero_max_attempts.rs:5:19
+  |
+5 |     #[queue(retry(max_attempts = 0))]
+  |                   ^^^^^^^^^^^^

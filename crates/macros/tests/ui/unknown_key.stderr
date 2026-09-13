@@ -1,0 +1,5 @@
+error: unknown key `concurrency` in `#[queue(...)]`, expected one of `name`, `prefetch`, `durable`, `message_ttl`, `max_priority`, `retry`
+ --> tests/ui/unknown_key.rs:5:28
+  |
+5 |     #[queue(prefetch = 10, concurrency = 4)]
+  |                            ^^^^^^^^^^^

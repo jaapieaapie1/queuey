@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/macros",
+    "crates/rabbitmq",
+    "crates/queuey",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jaapelst/queuey"
+
+[workspace.dependencies]
+queuey-core = { path = "crates/core", version = "0.1.0" }
+queuey-macros = { path = "crates/macros", version = "0.1.0" }
+queuey-rabbitmq = { path = "crates/rabbitmq", version = "0.1.0" }
+
+async-trait = "0.1"
+futures = "0.3"
+lapin = "4"
+rand = "0.10.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+proc-macro-crate = "3"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3.0.5", features = ["full", "extra-traits"] }
+
+# dev
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+trybuild = "1"

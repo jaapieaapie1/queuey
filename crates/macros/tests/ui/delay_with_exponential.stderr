@@ -1,0 +1,5 @@
+error: `delay` is only valid with `backoff = "fixed"`
+ --> tests/ui/delay_with_exponential.rs:5:44
+  |
+5 |     #[queue(retry(backoff = "exponential", delay = "1s"))]
+  |                                            ^^^^^

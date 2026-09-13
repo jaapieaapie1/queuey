@@ -1,0 +1,11 @@
+error: duplicate queue name `myapp.emails`
+ --> tests/ui/duplicate_names.rs:8:20
+  |
+8 |     #[queue(name = "emails")]
+  |                    ^^^^^^^^
+
+error: `myapp.emails` is first used here
+ --> tests/ui/duplicate_names.rs:6:20
+  |
+6 |     #[queue(name = "emails")]
+  |                    ^^^^^^^^

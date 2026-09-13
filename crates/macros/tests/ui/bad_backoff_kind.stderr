@@ -1,0 +1,5 @@
+error: unknown backoff `linear`, expected "none", "fixed" or "exponential"
+ --> tests/ui/bad_backoff_kind.rs:5:37
+  |
+5 |     #[queue(retry(max_attempts = 3, backoff = "linear"))]
+  |                                     ^^^^^^^

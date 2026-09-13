@@ -1,0 +1,5 @@
+error: `max_priority` must be an integer in 0..=255
+ --> tests/ui/queue_max_priority_out_of_range.rs:5:28
+  |
+5 |     #[queue(max_priority = 256)]
+  |                            ^^^

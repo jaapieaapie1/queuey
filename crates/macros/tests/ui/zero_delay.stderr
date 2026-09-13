@@ -1,0 +1,5 @@
+error: `delay` must be greater than zero: express "no backoff" as `backoff = "none"` instead
+ --> tests/ui/zero_delay.rs:5:67
+  |
+5 | #[job(queue = AppQueues::Emails, retry(backoff = "fixed", delay = "0ms"))]
+  |                                                                   ^^^^^
