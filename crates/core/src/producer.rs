@@ -44,10 +44,13 @@ impl<Q: QueueSet, B: Backend> Producer<Q, B> {
     /// Publish `job`, to become visible after `delay`.
     ///
     /// The plain delay: the job waits, then joins the back of the queue like any other
-    /// message (priority `0`). On RabbitMQ every delayed publish of a queue shares one
-    /// wait queue, so a message with a long delay sitting at its head holds up shorter
-    /// ones behind it. Use [`Producer::defer`] when the job must come back *ahead* of
-    /// the backlog, or when many different delays are in play.
+    /// message (priority `0`). On RabbitMQ it waits in the hold queue for its delay,
+    /// exactly as a retry does, so different delays never block each other. Use
+    /// [`Producer::defer`] when the job must come back *ahead* of the backlog.
+    ///
+    /// On RabbitMQ this needs the queue to have been declared through the same backend
+    /// (which [`Producer::new`] does and [`Producer::new_undeclared`] does not), and the
+    /// delay is capped at about 24.8 days; see the backend's docs.
     pub async fn enqueue_after<J: Job<Queue = Q>>(
         &self,
         job: &J,
@@ -66,10 +69,10 @@ impl<Q: QueueSet, B: Backend> Producer<Q, B> {
     /// normally in the meantime. The producer-side twin of a handler returning
     /// [`crate::JobError::Deferred`].
     ///
-    /// Contrast with [`Producer::enqueue_after`]: that shares one wait queue per queue
-    /// (head-of-line blocking between different delays on RabbitMQ) and returns at
-    /// priority `0`; this one is held per delay (equal delays drain strictly in order)
-    /// and returns at the top.
+    /// Contrast with [`Producer::enqueue_after`]: that returns at priority `0`, behind
+    /// the backlog; this one returns at the top. Both wait in a hold per delay, so
+    /// equal delays drain strictly in order and different delays never block each
+    /// other.
     pub async fn defer<J: Job<Queue = Q>>(&self, job: &J, delay: Duration) -> Result<uuid::Uuid> {
         let mut env = Envelope::new(job)?;
         env.priority = J::QUEUE.config().max_priority.unwrap_or(0);

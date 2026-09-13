@@ -6,7 +6,7 @@
 //! AMQP_URL=amqp://guest:guest@rabbit:5672/%2f cargo run -p queuey --example rabbitmq_end_to_end
 //! ```
 //!
-//! It declares the queues (plus their `.retry` and `.dead` companions), enqueues
+//! It declares the queues (plus their `.dead` companions), enqueues
 //! three jobs (one of which fails twice before succeeding), runs a worker until
 //! all three have settled, and shuts down. Ctrl-C also stops it cleanly.
 
@@ -106,7 +106,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let settled = Arc::new(Settled(AtomicUsize::new(0)));
 
-    // Declares `aq-example.emails`, `aq-example.emails.retry` and `.dead`.
+    // Declares `aq-example.emails` and `aq-example.emails.dead`. Hold queues for
+    // retry delays appear on demand and expire on their own.
     let producer = Producer::<AppQueues, _>::new(backend.clone()).await?;
 
     let worker = Worker::<AppQueues, _>::builder(backend)

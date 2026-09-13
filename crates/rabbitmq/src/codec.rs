@@ -3,8 +3,6 @@
 //! Nothing here touches the broker, so every function can be unit-tested
 //! without a running RabbitMQ.
 
-use std::time::Duration;
-
 use lapin::{
     BasicProperties,
     types::{AMQPValue, FieldTable, LongString, MAX_SHORT_STRING_LENGTH, ShortString},
@@ -13,7 +11,6 @@ use queuey_core::Envelope;
 
 use crate::topology::{
     HEADER_ATTEMPT, HEADER_ATTEMPTS, HEADER_DEATH_REASON, HEADER_DEFERRALS, HEADER_ORIGINAL_QUEUE,
-    MAX_TTL_MS,
 };
 
 /// `content-type` set on every published message.
@@ -53,34 +50,20 @@ pub fn base_headers(envelope: &Envelope) -> FieldTable {
 ///   backlog. A queue declared without `x-max-priority` ignores the property,
 ///   and a priority above the queue's `x-max-priority` is treated by the broker
 ///   as that maximum, so this is safe to set unconditionally.
-/// * `expiration` is set only when `delay` is `Some`, and is the delay in whole
-///   milliseconds rounded up (see [`expiration_ms`]).
+/// * `expiration` is **never** set, not even for a message bound for a hold
+///   queue. The wait is the hold queue's queue-wide `x-message-ttl`; a
+///   per-message expiration on top of it would reintroduce exactly the
+///   mixed-TTL head-of-line blocking that hold queues exist to avoid, and a
+///   shorter one would release the job early.
 #[must_use]
-pub fn props_for(envelope: &Envelope, delay: Option<Duration>) -> BasicProperties {
-    let props = BasicProperties::default()
+pub fn props_for(envelope: &Envelope) -> BasicProperties {
+    BasicProperties::default()
         .with_content_type(CONTENT_TYPE_JSON.into())
         .with_delivery_mode(DELIVERY_MODE_PERSISTENT)
         .with_message_id(clamped(&envelope.job_id.to_string()))
         .with_type(clamped(&envelope.job_type))
         .with_priority(envelope.priority)
-        .with_headers(base_headers(envelope));
-
-    match delay {
-        Some(delay) => props.with_expiration(clamped(&expiration_ms(delay))),
-        None => props,
-    }
-}
-
-/// AMQP properties for publishing `envelope` into a hold queue.
-///
-/// Identical to [`props_for`] with no delay, and that is the point: a deferred
-/// message must **not** carry an `expiration`. The wait is the hold queue's
-/// queue-wide `x-message-ttl`; a per-message expiration on top of it would
-/// reintroduce exactly the mixed-TTL head-of-line blocking that hold queues
-/// exist to avoid, and a shorter one would release the job early.
-#[must_use]
-pub fn deferred_props(envelope: &Envelope) -> BasicProperties {
-    props_for(envelope, None)
+        .with_headers(base_headers(envelope))
 }
 
 /// Headers recorded on a message routed to `q.dead`.
@@ -108,7 +91,7 @@ pub fn dead_letter_headers(envelope: &Envelope, reason: &str) -> FieldTable {
 /// AMQP properties for publishing `envelope` to its dead-letter queue.
 #[must_use]
 pub fn dead_letter_props(envelope: &Envelope, reason: &str) -> BasicProperties {
-    props_for(envelope, None).with_headers(dead_letter_headers(envelope, reason))
+    props_for(envelope).with_headers(dead_letter_headers(envelope, reason))
 }
 
 /// AMQP properties for a body that could not be decoded as an [`Envelope`].
@@ -129,26 +112,6 @@ pub fn malformed_props(original_queue: &str, reason: &str) -> BasicProperties {
     BasicProperties::default()
         .with_delivery_mode(DELIVERY_MODE_PERSISTENT)
         .with_headers(headers)
-}
-
-/// The AMQP `expiration` string for `delay`: whole milliseconds, rounded up and
-/// clamped to `[1, MAX_TTL_MS]`.
-///
-/// The lower bound exists because RabbitMQ treats an expiration of `0` as
-/// "expire immediately unless a consumer is waiting", which would defeat a
-/// backoff delay.
-///
-/// The upper bound exists because RabbitMQ parses `expiration` as a 32-bit
-/// millisecond count and answers anything larger with `PRECONDITION_FAILED`,
-/// killing the channel. [`MAX_TTL_MS`] is roughly 49 days, far beyond any
-/// sensible retry backoff, so clamping is strictly better than failing.
-#[must_use]
-pub fn expiration_ms(delay: Duration) -> String {
-    let ms = delay
-        .as_nanos()
-        .div_ceil(1_000_000)
-        .clamp(1, u128::from(MAX_TTL_MS));
-    ms.to_string()
 }
 
 /// Convert to a [`ShortString`], truncating at a UTF-8 boundary if needed.
@@ -200,7 +163,7 @@ mod tests {
 
     #[test]
     fn props_carry_content_type_and_persistence() {
-        let props = props_for(&envelope(), None);
+        let props = props_for(&envelope());
         assert_eq!(
             props.content_type().as_ref().map(ShortString::to_string),
             Some("application/json".to_owned())
@@ -210,7 +173,7 @@ mod tests {
 
     #[test]
     fn props_carry_message_id_and_type() {
-        let props = props_for(&envelope(), None);
+        let props = props_for(&envelope());
         assert_eq!(
             props.message_id().as_ref().map(ShortString::to_string),
             Some("67e55044-10b1-426f-9247-bb680e5fe0c8".to_owned())
@@ -223,7 +186,7 @@ mod tests {
 
     #[test]
     fn props_carry_the_attempt_and_deferrals_headers() {
-        let props = props_for(&envelope(), None);
+        let props = props_for(&envelope());
         let headers = props.headers().as_ref().expect("headers");
         assert_eq!(
             headers.inner().get(HEADER_ATTEMPT),
@@ -238,7 +201,7 @@ mod tests {
 
     #[test]
     fn the_deferrals_header_tracks_the_envelope() {
-        let props = props_for(&deferred_envelope(), None);
+        let props = props_for(&deferred_envelope());
         let headers = props.headers().as_ref().expect("headers");
         assert_eq!(
             headers.inner().get(HEADER_DEFERRALS),
@@ -255,12 +218,8 @@ mod tests {
     fn props_carry_the_envelope_priority() {
         // Normal work is priority 0, and the property is always set so a queue
         // with `x-max-priority` orders every message the same way.
-        assert_eq!(*props_for(&envelope(), None).priority(), Some(0));
-        assert_eq!(*props_for(&deferred_envelope(), None).priority(), Some(10));
-        assert_eq!(
-            *props_for(&envelope(), Some(Duration::from_secs(1))).priority(),
-            Some(0)
-        );
+        assert_eq!(*props_for(&envelope()).priority(), Some(0));
+        assert_eq!(*props_for(&deferred_envelope()).priority(), Some(10));
         assert_eq!(
             *dead_letter_props(&deferred_envelope(), "boom").priority(),
             Some(10)
@@ -268,95 +227,11 @@ mod tests {
     }
 
     #[test]
-    fn deferred_props_match_an_undelayed_publish() {
-        let envelope = deferred_envelope();
-        assert_eq!(deferred_props(&envelope), props_for(&envelope, None));
-    }
-
-    #[test]
-    fn deferred_props_have_no_expiration_because_the_hold_queue_times_the_wait() {
-        let props = deferred_props(&deferred_envelope());
-        assert!(
-            props.expiration().is_none(),
-            "a per-message expiration would fight the hold queue's x-message-ttl"
-        );
-        assert_eq!(*props.priority(), Some(10));
-        assert_eq!(*props.delivery_mode(), Some(2));
-        let headers = props.headers().as_ref().expect("headers");
-        assert_eq!(
-            headers.inner().get(HEADER_DEFERRALS),
-            Some(&AMQPValue::LongUInt(2))
-        );
-    }
-
-    #[test]
-    fn undelayed_props_have_no_expiration() {
-        assert!(props_for(&envelope(), None).expiration().is_none());
-    }
-
-    #[test]
-    fn delayed_props_carry_expiration_in_millis() {
-        let props = props_for(&envelope(), Some(Duration::from_secs(2)));
-        assert_eq!(
-            props.expiration().as_ref().map(ShortString::to_string),
-            Some("2000".to_owned())
-        );
-    }
-
-    #[test]
-    fn expiration_rounds_sub_millisecond_delays_up() {
-        assert_eq!(expiration_ms(Duration::from_nanos(1)), "1");
-        assert_eq!(expiration_ms(Duration::from_micros(999)), "1");
-    }
-
-    #[test]
-    fn expiration_never_returns_zero() {
-        assert_eq!(expiration_ms(Duration::ZERO), "1");
-    }
-
-    #[test]
-    fn expiration_rounds_partial_millis_up() {
-        assert_eq!(expiration_ms(Duration::from_micros(1_001)), "2");
-        assert_eq!(expiration_ms(Duration::from_micros(1_500)), "2");
-        assert_eq!(expiration_ms(Duration::from_micros(2_000)), "2");
-    }
-
-    #[test]
-    fn expiration_handles_whole_values() {
-        assert_eq!(expiration_ms(Duration::from_millis(1)), "1");
-        assert_eq!(expiration_ms(Duration::from_millis(250)), "250");
-        assert_eq!(expiration_ms(Duration::from_secs(300)), "300000");
-    }
-
-    #[test]
-    fn expiration_is_clamped_to_what_rabbitmq_accepts() {
-        // Not `u64::MAX`: RabbitMQ parses `expiration` as 32-bit millis and
-        // answers anything larger with PRECONDITION_FAILED.
-        assert_eq!(expiration_ms(Duration::MAX), MAX_TTL_MS.to_string());
-    }
-
-    #[test]
-    fn expiration_exactly_at_the_limit_is_kept_verbatim() {
-        assert_eq!(
-            expiration_ms(Duration::from_millis(u64::from(MAX_TTL_MS))),
-            MAX_TTL_MS.to_string()
-        );
-    }
-
-    #[test]
-    fn expiration_one_millisecond_past_the_limit_is_clamped() {
-        assert_eq!(
-            expiration_ms(Duration::from_millis(u64::from(MAX_TTL_MS) + 1)),
-            MAX_TTL_MS.to_string()
-        );
-    }
-
-    #[test]
-    fn a_clamped_expiration_still_fits_a_short_string() {
-        let props = props_for(&envelope(), Some(Duration::MAX));
-        let expiration = props.expiration().as_ref().expect("expiration").to_string();
-        assert!(expiration.len() <= MAX_SHORT_STRING_LENGTH);
-        assert_eq!(expiration, "4294967295");
+    fn props_never_carry_an_expiration_because_the_hold_queue_times_the_wait() {
+        // A per-message expiration would fight the hold queue's x-message-ttl
+        // and bring back head-of-line blocking between different delays.
+        assert!(props_for(&envelope()).expiration().is_none());
+        assert!(props_for(&deferred_envelope()).expiration().is_none());
     }
 
     #[test]
@@ -417,7 +292,7 @@ mod tests {
     fn over_long_job_type_is_truncated_not_panicked() {
         let mut env = envelope();
         env.job_type = "é".repeat(400);
-        let props = props_for(&env, None);
+        let props = props_for(&env);
         let kind = props.kind().as_ref().expect("type").to_string();
         assert!(
             kind.len() <= MAX_SHORT_STRING_LENGTH,
@@ -441,7 +316,7 @@ mod tests {
     fn exactly_max_length_is_kept_verbatim() {
         let mut env = envelope();
         env.job_type = "a".repeat(MAX_SHORT_STRING_LENGTH);
-        let props = props_for(&env, None);
+        let props = props_for(&env);
         assert_eq!(
             props.kind().as_ref().map(ShortString::to_string),
             Some(env.job_type)

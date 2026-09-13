@@ -1,33 +1,45 @@
 //! Pure helpers describing the RabbitMQ topology used by this backend.
 //!
-//! For a logical queue `q` the backend maintains three long-lived broker queues
-//! plus one short-lived *hold* queue per distinct deferral delay:
+//! For a logical queue `q` the backend maintains two long-lived broker queues
+//! plus one short-lived *hold* queue per distinct delay:
 //!
 //! | queue | role | arguments |
 //! |---|---|---|
 //! | `q` | main work queue | `x-message-ttl` when [`QueueConfig::message_ttl`] is set, `x-max-priority` when [`QueueConfig::max_priority`] is `Some` |
-//! | `q.retry` | delay / wait queue | `x-dead-letter-exchange = ""`, `x-dead-letter-routing-key = q` |
 //! | `q.dead` | dead-letter queue | none |
-//! | `q.deferred.{ttl_ms}` | hold queue for one deferral delay | `x-message-ttl = ttl_ms`, `x-dead-letter-exchange = ""`, `x-dead-letter-routing-key = q`, `x-expires = 2 * ttl_ms` |
+//! | `q.deferred.{ttl_ms}` | hold queue for one delay | `x-message-ttl = ttl_ms`, `x-dead-letter-exchange = ""`, `x-dead-letter-routing-key = q`, `x-expires = 2 * ttl_ms` |
 //!
-//! Retries are published to `q.retry` with a per-message `expiration`; when the
-//! message expires RabbitMQ dead-letters it back onto `q` via the default
-//! exchange. Because a classic queue only ever expires messages from its head,
-//! a long-lived message at the head can delay shorter ones behind it
-//! (head-of-line blocking). This is a known and accepted trade-off for v1.
+//! Every wait, whether a retry backoff, a delayed enqueue or a deferral, goes
+//! through a hold queue. There is no shared wait queue with per-message
+//! expirations, and this is why:
 //!
-//! # Why hold queues do not suffer head-of-line blocking
+//! # Why hold queues instead of per-message `expiration`
 //!
-//! A deferral never sets a per-message `expiration`. Instead the delay is baked
-//! into the *name* of the queue it is held in (`q.deferred.30000` holds every
-//! 30-second deferral for `q`), and the wait is the queue-wide `x-message-ttl`.
-//! Every message in one hold queue therefore has the same TTL, so they expire in
-//! exactly the order they were published and the head is always the message that
-//! is due next. A short deferral can never be stuck behind a long one, because
-//! the two live in different queues. The price is one queue per distinct delay,
-//! which is why delays are rounded up to
+//! A classic queue only ever expires the message at its *head*. Messages behind
+//! it are not examined until it has gone, so in a shared wait queue a message
+//! with a five-minute expiration at the head holds back every one-second
+//! expiration behind it (head-of-line blocking). Exponential backoff produces
+//! exactly that mix, so retries were the worst-hit case.
+//!
+//! A hold queue never sets a per-message `expiration`. Instead the delay is
+//! baked into the *name* of the queue the message waits in (`q.deferred.30000`
+//! holds every 30-second wait for `q`), and the wait is the queue-wide
+//! `x-message-ttl`. Every message in one hold queue therefore has the same TTL,
+//! so they expire in exactly the order they were published and the head is
+//! always the message that is due next. A short wait can never be stuck behind a
+//! long one, because the two live in different queues. The price is one queue
+//! per distinct delay, which is why delays are rounded up to a granularity:
+//! [`RabbitMqOptions::retry_granularity`](crate::RabbitMqOptions::retry_granularity)
+//! for retries and delayed enqueues,
 //! [`RabbitMqOptions::deferred_granularity`](crate::RabbitMqOptions::deferred_granularity)
-//! (default one second), so `29.2s` and `30s` share `q.deferred.30000`.
+//! for deferrals (both default to one second), so `29.2s` and `30s` share
+//! `q.deferred.30000`.
+//!
+//! Retries and deferrals share the hold queues: the arguments depend only on the
+//! delay, and what differs between the two, the message priority, travels on the
+//! message and only matters once it is back on `q`. A retry returns at priority
+//! `0` and joins the back of the queue; a deferral returns at the queue's top
+//! priority and overtakes the backlog.
 //!
 //! # Why a hold queue's arguments depend only on its name
 //!
@@ -37,14 +49,14 @@
 //! RabbitMQ refuses a declaration whose arguments differ from the existing
 //! queue's (`PRECONDITION_FAILED`, which closes the declaring channel): a
 //! tunable in `x-expires` would deadlock the two processes against each other
-//! for ever, one of them unable to defer at all. Hence `x-expires = 2 * ttl_ms`
+//! for ever, one of them unable to schedule a single wait. Hence `x-expires = 2 * ttl_ms`
 //! and nothing else: an idle hold queue deletes itself one TTL after the last
-//! deferred publish to it, and every declare resets that timer, which is why the
+//! publish to it, and every declare resets that timer, which is why the
 //! queue is redeclared before every publish.
 //!
 //! `x-expires` must also be strictly greater than `x-message-ttl`, or the broker
 //! could delete a queue that still owes a message. `2 * ttl_ms` satisfies that
-//! for every TTL up to [`MAX_DEFERRAL_MS`], which is why a longer deferral is
+//! for every TTL up to [`MAX_DEFERRAL_MS`], which is why a longer delay is
 //! refused rather than silently clamped.
 //!
 //! Everything in this module is pure: it never touches a connection, so it can
@@ -58,16 +70,15 @@ use lapin::{
 };
 use queuey_core::QueueConfig;
 
-/// Default suffix appended to a queue name to build its retry queue.
-pub const DEFAULT_RETRY_SUFFIX: &str = ".retry";
-
 /// Default suffix appended to a queue name to build its dead-letter queue.
 pub const DEFAULT_DEAD_SUFFIX: &str = ".dead";
 
 /// Default infix between a queue name and a hold queue's TTL.
 ///
 /// A hold queue is named `{q}{suffix}.{ttl_ms}`, so with the default a 30-second
-/// deferral of `myapp.emails` waits in `myapp.emails.deferred.30000`.
+/// wait (retry or deferral) of `myapp.emails` happens in
+/// `myapp.emails.deferred.30000`. The name says "deferred" because deferrals
+/// were the first user; retries and delayed enqueues share the very same queues.
 pub const DEFAULT_DEFERRED_SUFFIX: &str = ".deferred";
 
 /// Header carrying the dead-lettering reason on messages routed to `q.dead`.
@@ -101,8 +112,8 @@ pub const ARG_MESSAGE_TTL: &str = "x-message-ttl";
 /// Queue argument declaring how many priority levels a queue supports.
 ///
 /// Set on the main queue `q` from [`QueueConfig::max_priority`]. Never set on
-/// `q.retry`, `q.dead` or a hold queue: those are strictly FIFO holding pens and
-/// a priority queue costs the broker an index per level.
+/// `q.dead` or a hold queue: those are strictly FIFO holding pens and a priority
+/// queue costs the broker an index per level.
 pub const ARG_MAX_PRIORITY: &str = "x-max-priority";
 
 /// Queue argument making the broker delete a queue after it has been unused for
@@ -114,13 +125,16 @@ pub const ARG_EXPIRES: &str = "x-expires";
 
 /// Largest time-to-live RabbitMQ accepts, in milliseconds (~49.7 days).
 ///
-/// Both `x-message-ttl` and the per-message `expiration` property are parsed as
-/// unsigned 32-bit millisecond counts. A larger value is refused with
-/// `PRECONDITION_FAILED`, which closes the channel, so this crate clamps rather
-/// than letting a huge [`Duration`] take the channel down.
+/// `x-message-ttl` and `x-expires` are parsed as unsigned 32-bit millisecond
+/// counts. A larger value is refused with `PRECONDITION_FAILED`, which closes
+/// the channel, so this crate clamps a queue TTL rather than letting a huge
+/// [`Duration`] take the channel down.
 pub const MAX_TTL_MS: u32 = u32::MAX;
 
-/// Longest deferral this backend will hold, in milliseconds (~24.8 days).
+/// Longest delay this backend will hold, in milliseconds (~24.8 days).
+///
+/// Applies to every wait that goes through a hold queue: retry backoffs, delayed
+/// enqueues and deferrals alike.
 ///
 /// A hold queue is declared with `x-expires = 2 * x-message-ttl` (see the module
 /// docs for why the factor is fixed rather than configurable), and `x-expires`
@@ -130,23 +144,9 @@ pub const MAX_TTL_MS: u32 = u32::MAX;
 /// delete a hold queue that still owes a message.
 ///
 /// A longer delay is **refused**, not clamped: clamping would release the job
-/// early, and "never early" is the one timing guarantee a deferral makes. See
+/// early, and "never early" is the one timing guarantee a hold makes. See
 /// [`deferred_ttl_ms`].
 pub const MAX_DEFERRAL_MS: u32 = MAX_TTL_MS / 2;
-
-/// Name of the retry (wait) queue for `queue`.
-///
-/// The prefix, if any, is already part of `queue`, so a prefixed queue
-/// keeps its prefix: `myapp.emails` becomes `myapp.emails.retry`.
-///
-/// ```
-/// use queuey_rabbitmq::topology::{retry_queue_name, DEFAULT_RETRY_SUFFIX};
-/// assert_eq!(retry_queue_name("emails", DEFAULT_RETRY_SUFFIX), "emails.retry");
-/// ```
-#[must_use]
-pub fn retry_queue_name(queue: &str, suffix: &str) -> String {
-    format!("{queue}{suffix}")
-}
 
 /// Name of the dead-letter queue for `queue`.
 ///
@@ -159,10 +159,11 @@ pub fn dead_queue_name(queue: &str, suffix: &str) -> String {
     format!("{queue}{suffix}")
 }
 
-/// Name of the hold queue holding `ttl_ms`-long deferrals of `queue`.
+/// Name of the hold queue holding `ttl_ms`-long waits of `queue`.
 ///
 /// The TTL is part of the name on purpose: one queue per distinct delay is what
-/// makes a hold queue drain strictly in order (see the module docs).
+/// makes a hold queue drain strictly in order (see the module docs). Retries and
+/// deferrals with the same rounded delay share the queue.
 ///
 /// ```
 /// use queuey_rabbitmq::topology::{deferred_queue_name, DEFAULT_DEFERRED_SUFFIX};
@@ -182,11 +183,12 @@ pub fn deferred_queue_name(queue: &str, suffix: &str, ttl_ms: u32) -> String {
 ///
 /// Rounding up is what bounds the number of hold queues: with the default
 /// one-second granularity every delay between `29.001s` and `30s` maps to
-/// `30000`, so a burst of `Retry-After: 30` responses shares one queue. Rounding
-/// *up* rather than to nearest guarantees the job never comes back early, and
-/// [`None`] rather than a clamp at the top end is the same guarantee: a delay
-/// this backend cannot hold is refused, never shortened. The rounding
-/// itself can push a delay over the cap, so a `delay` just under
+/// `30000`, so a burst of `Retry-After: 30` responses shares one queue, and a
+/// jittered exponential backoff creates at most one queue per whole second of
+/// its range. Rounding *up* rather than to nearest guarantees the job never
+/// comes back early, and [`None`] rather than a clamp at the top end is the same
+/// guarantee: a delay this backend cannot hold is refused, never shortened. The
+/// rounding itself can push a delay over the cap, so a `delay` just under
 /// [`MAX_DEFERRAL_MS`] may still be refused.
 ///
 /// `granularity` is itself clamped to `[1ms, MAX_DEFERRAL_MS]`, so a zero or
@@ -252,8 +254,8 @@ pub fn queue_args(config: &QueueConfig) -> FieldTable {
 /// * `x-dead-letter-exchange = ""` plus `x-dead-letter-routing-key = q`: an
 ///   expired message goes straight back onto the main queue.
 /// * `x-expires = 2 * ttl_ms`: an idle hold queue deletes itself one TTL after
-///   the last deferred publish to it, so a delay that never recurs leaves
-///   nothing behind. Every declare resets that timer, which is why the queue is
+///   the last publish to it, so a delay that never recurs leaves nothing
+///   behind. Every declare resets that timer, which is why the queue is
 ///   redeclared before every publish.
 ///
 /// The arguments are a pure function of the hold queue's *name*: `ttl_ms` is in
@@ -297,7 +299,7 @@ pub fn deferred_queue_args(config: &QueueConfig, ttl_ms: u32) -> FieldTable {
 /// Declaration options for a queue that is never exclusive or auto-deleted.
 ///
 /// Shared by the backend's own declarations and by the on-demand hold queue
-/// declaration on the publishing channel, so the two can never disagree about
+/// declaration on the declaration channel, so the two can never disagree about
 /// the flags and provoke a `PRECONDITION_FAILED`.
 pub(crate) fn declare_options(durable: bool) -> QueueDeclareOptions {
     QueueDeclareOptions {
@@ -307,24 +309,6 @@ pub(crate) fn declare_options(durable: bool) -> QueueDeclareOptions {
         auto_delete: false,
         nowait: false,
     }
-}
-
-/// Declaration arguments for the retry queue `q.retry`.
-///
-/// Expired messages are dead-lettered through the default exchange straight
-/// back onto the main queue.
-#[must_use]
-pub fn retry_queue_args(config: &QueueConfig) -> FieldTable {
-    let mut args = FieldTable::default();
-    args.insert(
-        ARG_DEAD_LETTER_EXCHANGE.into(),
-        AMQPValue::LongString(LongString::from("")),
-    );
-    args.insert(
-        ARG_DEAD_LETTER_ROUTING_KEY.into(),
-        AMQPValue::LongString(LongString::from(config.name.as_str())),
-    );
-    args
 }
 
 /// Declaration arguments for the dead-letter queue `q.dead`.
@@ -363,22 +347,6 @@ mod tests {
     }
 
     #[test]
-    fn retry_name_without_prefix() {
-        assert_eq!(
-            retry_queue_name("emails", DEFAULT_RETRY_SUFFIX),
-            "emails.retry"
-        );
-    }
-
-    #[test]
-    fn retry_name_with_prefix() {
-        assert_eq!(
-            retry_queue_name("myapp.emails", DEFAULT_RETRY_SUFFIX),
-            "myapp.emails.retry"
-        );
-    }
-
-    #[test]
     fn dead_name_without_prefix() {
         assert_eq!(
             dead_queue_name("emails", DEFAULT_DEAD_SUFFIX),
@@ -396,7 +364,6 @@ mod tests {
 
     #[test]
     fn custom_suffixes_are_honoured() {
-        assert_eq!(retry_queue_name("q", "-wait"), "q-wait");
         assert_eq!(dead_queue_name("q", "-dlq"), "q-dlq");
     }
 
@@ -469,7 +436,6 @@ mod tests {
     #[test]
     fn only_the_main_queue_gets_priorities() {
         let cfg = config("emails");
-        assert!(!retry_queue_args(&cfg).contains_key(ARG_MAX_PRIORITY));
         assert!(!dead_queue_args(&cfg).contains_key(ARG_MAX_PRIORITY));
         assert!(!deferred_queue_args(&cfg, 1_000).contains_key(ARG_MAX_PRIORITY));
     }
@@ -524,29 +490,6 @@ mod tests {
             args.inner().get(ARG_MESSAGE_TTL),
             Some(&AMQPValue::LongLongInt(i64::from(MAX_TTL_MS)))
         );
-    }
-
-    #[test]
-    fn retry_args_dead_letter_back_to_the_main_queue() {
-        let args = retry_queue_args(&config("myapp.emails"));
-        assert_eq!(
-            args.inner().get(ARG_DEAD_LETTER_EXCHANGE),
-            Some(&AMQPValue::LongString(LongString::from("")))
-        );
-        assert_eq!(
-            args.inner().get(ARG_DEAD_LETTER_ROUTING_KEY),
-            Some(&AMQPValue::LongString(LongString::from("myapp.emails")))
-        );
-        assert_eq!(args.inner().len(), 2);
-    }
-
-    #[test]
-    fn retry_args_never_carry_a_queue_ttl() {
-        // A queue-level TTL on the wait queue would fight the per-message
-        // expiration used for the backoff delay.
-        let cfg = config("emails").message_ttl(Duration::from_secs(5));
-        let args = retry_queue_args(&cfg);
-        assert!(!args.contains_key(ARG_MESSAGE_TTL));
     }
 
     #[test]

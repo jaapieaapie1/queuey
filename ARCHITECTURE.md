@@ -116,32 +116,41 @@ plus `#[allow(clippy::approx_constant)]` for `factor` literals such as `3.141592
 ## RabbitMQ topology (per queue `q`)
 
 - `q`: main durable queue. Consumers use `basic_qos(prefetch)`.
-- `q.retry`: wait queue, `x-dead-letter-exchange = ""`, `x-dead-letter-routing-key = q`. Retries are
-  published here with per-message `expiration = delay_ms`. (Head-of-line TTL caveat documented;
-  acceptable for v1.)
 - `q.dead`: dead-letter queue; failed envelopes published here with headers
   `x-death-reason`, `x-original-queue`, `x-attempts`.
-- `Delivery::retry`: publish to `q.retry` with publisher confirms, then `basic_ack` original.
+- `q.deferred.{ttl_ms}`: hold queue per distinct delay, shared by retries and deferrals; see
+  the Deferral section for its arguments. **There is no `q.retry`.** A shared wait queue with
+  per-message `expiration` suffers head-of-line blocking (RabbitMQ only expires the head of a
+  classic queue, so a 5-minute retry at the head holds back every 1-second retry behind it),
+  and exponential backoff produces exactly that mix. Per-message `expiration` is never set.
+- `Delivery::retry`: declare the hold queue for `delay` rounded up to
+  `RabbitMqOptions::retry_granularity`, publish `next` there (priority `0`) with publisher
+  confirms, then `basic_ack` original.
 - `Delivery::dead_letter`: publish to `q.dead` with confirms, then `basic_ack` original.
-- `publish(delay = Some)`: route via `q.retry` with expiration.
+- `publish(delay = Some)`: same hold as a retry (`retry_granularity`, priority as carried by the
+  envelope, `0` for a fresh one). Requires the queue to have been declared through this backend
+  (`Error::UnknownQueue` otherwise) and a delay within `MAX_DEFERRAL_MS`, exactly like `defer`.
 - All publishes are `mandatory`: an unroutable routing key (a queue nobody declared) comes back
   as a `basic.return` and is reported as an error, so the original is never acked for a message
-  that went nowhere. `x-message-ttl` / `expiration` are clamped to `[1, u32::MAX]` ms.
+  that went nowhere. `x-message-ttl` on `q` is clamped to `[1, u32::MAX]` ms.
 - With `declare_dead_letter_queues = false` the backend does not own `q.dead`, so `dead_letter`
   (and a malformed body) `basic_reject`s the delivery with `requeue = false` (the broker's own
   DLX policy on `q` applies if configured, otherwise the message is dropped) and logs at `WARN`.
 - Envelope JSON body, `content_type = application/json`, `delivery_mode = persistent`,
   `message_id = job_id`, `type = job_type`.
-- Connection: single `lapin::Connection`, one channel for publishing (confirm mode), one channel per consumer.
+- Connection: single `lapin::Connection`, one channel for publishing (confirm mode), one channel
+  for hold queue declarations, one channel per consumer.
 - Reconnect is **out of scope for v1**; stream ends on connection loss, `Worker::run` returns `Err`.
 
 ## Deferral (hold queues, priority return)
 
 Motivating case: an external API answers `429 Too Many Requests` with `Retry-After: 30`. The
 job did not fail; it must wait *exactly* that long and then run **before** the backlog that has
-piled up on the main queue meanwhile. Retries (`q.retry`, per-message `expiration`) fit badly:
-head-of-line blocking mixes delays, the attempt counter burns down, and the returning message
-lands at the tail. Deferral is the generic name; rate limiting is the first user.
+piled up on the main queue meanwhile. A retry fits badly: the attempt counter burns down and the
+returning message lands at the tail. Deferral is the generic name; rate limiting is the first
+user. (Retries originally used a shared `q.retry` with per-message `expiration` and suffered
+head-of-line blocking between delays; they now use the hold queues described here as well, with
+their own `retry_granularity`.)
 
 ### Core API
 
@@ -152,9 +161,9 @@ lands at the tail. Deferral is the generic name; rate limiting is the first user
   `#[serde(default)] pub priority: u8` (AMQP message priority, `0` = normal). Both default so
   envelopes from before this feature still decode. `Envelope::deferred(&self, priority: u8) -> Self`
   = clone with `deferrals + 1` and `priority` set; `attempt`, `job_id`, `enqueued_at_ms` unchanged.
-- `Envelope::next_attempt` resets `priority` to `0` and keeps `deferrals`: a retry is scheduled
-  through `q.retry` like any other and must not jump the backlog; only the scheduling action
-  that just happened decides the priority.
+- `Envelope::next_attempt` resets `priority` to `0` and keeps `deferrals`: a retry waits in a
+  hold queue like a deferral but must not jump the backlog when it returns; only the scheduling
+  action that just happened decides the priority.
 - `JobContext` gains `deferrals: u32` and `priority: u8`. There is no built-in deferral cap: a
   handler that wants one checks `ctx.deferrals` and returns `JobError::Fatal`.
 - `QueueConfig` gains `pub max_priority: Option<u8>` (default `Some(10)`), builder
@@ -170,8 +179,8 @@ lands at the tail. Deferral is the generic name; rate limiting is the first user
   `delay`, **then** ack the original. Same "publish before ack" rule as `retry`.
 - `Backend::defer(&self, envelope: &Envelope, delay: Duration) -> Result<()>`: the publish half
   of the above, also used by `Producer::defer(&job, delay) -> Result<Uuid>` (first-attempt
-  envelope, `deferrals = 0`, priority set, published to the hold queue). `enqueue_after` is
-  unchanged (shared `q.retry`, priority `0`).
+  envelope, `deferrals = 0`, priority set, published to the hold queue). `enqueue_after` uses the
+  same hold queues at priority `0`, rounded to `retry_granularity`.
 - Worker: `JobOutcome::Deferred { delay, reason }` -> `info!(?delay, deferrals, reason, "job deferred")`
   -> `settle(delivery.defer(envelope.deferred(priority), delay), "defer")`. Job span unchanged.
 - `MemoryBackend`: `defer` sleeps `delay` (virtual-time friendly) then inserts by priority:
@@ -191,7 +200,7 @@ lands at the tail. Deferral is the generic name; rate limiting is the first user
 - Main queue `q` is declared with `x-max-priority = QueueConfig::max_priority` when `Some`.
   **Changing the arguments of an existing queue is refused by the broker**
   (`PRECONDITION_FAILED` closes the channel): existing deployments must either delete `q` or
-  set `max_priority = 0`. `q.retry`, `q.dead` and hold queues never get `x-max-priority`.
+  set `max_priority = 0`. `q.dead` and hold queues never get `x-max-priority`.
 - Every publish sets the AMQP `priority` property from `Envelope::priority` and the header
   `x-deferrals` from `Envelope::deferrals`.
 - Hold queue per (queue, TTL): name `{q}{deferred_suffix}.{ttl_ms}` (default suffix
@@ -213,18 +222,21 @@ lands at the tail. Deferral is the generic name; rate limiting is the first user
   (`Producer::new`, `WorkerBuilder::build`): the hold queue dead-letters to `q` by name, so
   deferring onto a queue this backend never declared would strand the message. Hence
   `Producer::new_undeclared` + `defer` -> `Error::UnknownQueue`.
-- `ttl_ms = ceil(delay / deferred_granularity) * deferred_granularity`, clamped to
-  `[granularity, MAX_DEFERRAL_MS]`; default granularity `1s`, so `Retry-After: 30` and a `29.2s`
-  delay share `...deferred.30000`. Granularity bounds the number of hold queues. A delay above
-  `MAX_DEFERRAL_MS` is an error, not a clamp.
+- `ttl_ms = ceil(delay / granularity) * granularity`, clamped to `[granularity, MAX_DEFERRAL_MS]`;
+  the granularity is `deferred_granularity` for deferrals and `retry_granularity` for retries and
+  `enqueue_after`, both `1s` by default, so `Retry-After: 30` and a `29.2s` delay share
+  `...deferred.30000`. Granularity bounds the number of hold queues; the retry one exists so a
+  jittered exponential backoff (a new delay on every retry) can be rounded coarsely without
+  touching `Retry-After` precision. A delay above `MAX_DEFERRAL_MS` is an error, not a clamp.
 - The worst-case hold-queue name (`{q}{deferred_suffix}.{MAX_DEFERRAL_MS}`) is validated at
   `declare`, so a queue name that could later produce an over-long hold-queue name fails at
   startup rather than on the first deferral.
-- `RabbitMqOptions` gains `deferred_suffix: String` (`".deferred"`) and
-  `deferred_granularity: Duration` (`1s`, must be > 0). Builders for each.
-- `Delivery::defer` = declare hold queue, `publish_confirmed` (mandatory) there with the
-  envelope's priority and `expiration` **unset** (the queue TTL does the timing), then ack.
-  Publish failure leaves the original unacked, as for `retry`.
+- `RabbitMqOptions` has `deferred_suffix: String` (`".deferred"`), `deferred_granularity: Duration`
+  (`1s`) and `retry_granularity: Duration` (`1s`). Builders for each. `retry_suffix` no longer
+  exists.
+- `Delivery::defer` and `Delivery::retry` = declare hold queue, `publish_confirmed` (mandatory)
+  there with the envelope's priority and `expiration` **unset** (the queue TTL does the timing),
+  then ack. Publish failure leaves the original unacked.
 - The `x-death` header RabbitMQ adds when the TTL expires is ignored; `deferrals` in the body
   is the source of truth.
 
@@ -250,7 +262,12 @@ lands at the tail. Deferral is the generic name; rate limiting is the first user
   the original delivery stays **unacked** and the confirm publishing channel stays usable
   (the declaration channel is the only casualty); `defer` onto a queue this backend never
   declared -> `Error::UnknownQueue`, nothing published; a delay past `MAX_DEFERRAL_MS` is
-  refused with an `Err` instead of being released early.
+  refused with an `Err` instead of being released early; a 500ms retry waits in `q.deferred.1000`
+  and comes back with `attempt + 1`; a 1-second retry published *after* a 6-second retry returns
+  in about a second (the head-of-line proof); a retry and a deferral with the same delay share
+  one hold queue and the deferral is consumed first; `retry_granularity` and
+  `deferred_granularity` round the same delay into different hold queues; a delayed publish onto
+  an undeclared queue is `Error::UnknownQueue`.
 
 ## Testing strategy
 
@@ -264,7 +281,8 @@ lands at the tail. Deferral is the generic name; rate limiting is the first user
   `name`, `config`, `Job::NAME`, `Job::QUEUE`, `retry_policy`).
 - rabbitmq: pure unit tests for topology naming, header/property mapping, envelope <-> lapin
   `BasicProperties`; integration tests behind `AMQP_URL` env var (`#[ignore]`-free but early-return
-  with an `eprintln!` skip notice when unset), exercising declare / publish / consume / retry / dead-letter.
+  with an `eprintln!` skip notice when unset), exercising declare / publish / consume / retry /
+  defer / dead-letter.
 - facade: compile-fail test proving cross-queue-set enqueue is rejected; end-to-end example.
 
 ## Conventions

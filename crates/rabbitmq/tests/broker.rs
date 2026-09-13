@@ -35,13 +35,15 @@ fn unique_queue(label: &str) -> String {
     format!("aq-test.{label}.{}", Uuid::new_v4().simple())
 }
 
-/// The three broker queues backing `queue`, under the default suffixes.
-fn family(queue: &str) -> [String; 3] {
-    [
-        queue.to_owned(),
-        format!("{queue}.retry"),
-        format!("{queue}.dead"),
-    ]
+/// The two long-lived broker queues backing `queue`, under the default suffixes.
+fn family(queue: &str) -> [String; 2] {
+    [queue.to_owned(), format!("{queue}.dead")]
+}
+
+/// The hold queue a `delay` on `queue` waits in, at the default one-second
+/// granularity.
+fn hold_queue(queue: &str, delay: Duration) -> String {
+    format!("{queue}.deferred.{}", delay.as_millis())
 }
 
 fn envelope(queue: &str, attempt: u32) -> Envelope {
@@ -271,7 +273,7 @@ async fn declare_is_idempotent() {
         .await
         .expect("second declare with identical arguments");
 
-    // All three queues exist and are empty.
+    // Both queues exist and are empty.
     for name in family(&queue) {
         assert_eq!(ready_count(&control, &name).await, 0, "queue {name}");
     }
@@ -387,24 +389,33 @@ async fn delayed_publish_waits_for_the_delay() {
     let mut stream = backend.consume(&config).await.expect("consume");
 
     let sent = envelope(&queue, 1);
+    let delay = Duration::from_secs(2);
     backend
-        .publish(&sent, Some(Duration::from_secs(2)))
+        .publish(&sent, Some(delay))
         .await
         .expect("delayed publish");
 
-    // It waits on `queue.retry`, not on `queue`. Asserting on `queue` would be
-    // vacuous: a consumer is attached, so anything landing there is taken off
-    // again immediately and the ready count reads 0 either way.
-    await_count(&control, &format!("{queue}.retry"), 1).await;
+    // It waits in the hold queue for its delay, not on `queue`. Asserting on
+    // `queue` would be vacuous: a consumer is attached, so anything landing
+    // there is taken off again immediately and the ready count reads 0 either
+    // way.
+    let hold = hold_queue(&queue, delay);
+    await_count(&control, &hold, 1).await;
     expect_idle(&mut stream, Duration::from_millis(1_200)).await;
 
     let delivery = next_delivery(&mut stream, Duration::from_secs(8)).await;
     assert_eq!(delivery.envelope(), &sent);
+    assert_eq!(
+        *delivery.envelope(),
+        sent,
+        "a delayed publish comes back byte for byte"
+    );
     delivery.ack().await.expect("ack");
 
     drop(stream);
     backend.close().await.expect("close");
     cleanup(&control, &queue).await;
+    delete_queues(&control, &[hold]).await;
 }
 
 #[tokio::test]
@@ -431,16 +442,27 @@ async fn retry_redelivers_with_the_next_attempt() {
     assert_eq!(first.envelope().attempt, 1);
 
     let next = first.envelope().next_attempt();
+    let started = Instant::now();
     first
         .retry(next.clone(), Duration::from_millis(500))
         .await
         .expect("retry");
+
+    // 500ms rounds up to the default one-second granularity, so the retry
+    // waits in `q.deferred.1000` alongside any other sub-second delay.
+    let hold = hold_queue(&queue, Duration::from_secs(1));
+    assert_eq!(ready_count(&control, &hold).await, 1, "held in `{hold}`");
 
     // Not before the delay ...
     expect_idle(&mut stream, Duration::from_millis(250)).await;
 
     // ... and then the same job with attempt + 1.
     let second = next_delivery(&mut stream, Duration::from_secs(8)).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "retry came back after {elapsed:?}; rounding up to the granularity means never early"
+    );
     assert_eq!(second.envelope().job_id, sent.job_id, "same job id");
     assert_eq!(second.envelope().attempt, 2, "attempt was incremented");
     assert_eq!(second.envelope(), &next);
@@ -449,8 +471,239 @@ async fn retry_redelivers_with_the_next_attempt() {
     drop(stream);
     backend.close().await.expect("close");
     await_count(&control, &queue, 0).await;
-    await_count(&control, &format!("{queue}.retry"), 0).await;
+    await_count(&control, &hold, 0).await;
     cleanup(&control, &queue).await;
+    delete_queues(&control, &[hold]).await;
+}
+
+#[tokio::test]
+async fn a_short_retry_is_not_stuck_behind_a_long_one() {
+    let Some(url) = std::env::var("AMQP_URL").ok() else {
+        eprintln!("skipping: AMQP_URL not set");
+        return;
+    };
+
+    // The reason retries live in hold queues at all. With one shared wait queue
+    // and per-message expirations, RabbitMQ only expires the head, so the
+    // 6-second retry published *first* would hold the 1-second retry behind it
+    // for the full six seconds. In separate hold queues each expires on its
+    // own clock.
+    let queue = unique_queue("retry-hol");
+    let config = QueueConfig::new(queue.clone());
+    let backend = RabbitMqBackend::connect(&url).await.expect("connect");
+    let control = control(&url).await;
+    backend
+        .declare(std::slice::from_ref(&config))
+        .await
+        .expect("declare");
+
+    let slow = envelope(&queue, 1);
+    let fast = envelope(&queue, 1);
+    backend.publish(&slow, None).await.expect("publish");
+    backend.publish(&fast, None).await.expect("publish");
+
+    let mut stream = backend.consume(&config).await.expect("consume");
+    let first = next_delivery(&mut stream, Duration::from_secs(5)).await;
+    let second = next_delivery(&mut stream, Duration::from_secs(5)).await;
+    assert_eq!(first.envelope(), &slow, "FIFO on the work queue");
+    assert_eq!(second.envelope(), &fast);
+
+    let slow_next = slow.next_attempt();
+    let fast_next = fast.next_attempt();
+    let long_delay = Duration::from_secs(6);
+    let short_delay = Duration::from_secs(1);
+    let started = Instant::now();
+    // The long one goes first, so it would be at the head of a shared queue.
+    first
+        .retry(slow_next.clone(), long_delay)
+        .await
+        .expect("retry (long)");
+    second
+        .retry(fast_next.clone(), short_delay)
+        .await
+        .expect("retry (short)");
+
+    let long_hold = hold_queue(&queue, long_delay);
+    let short_hold = hold_queue(&queue, short_delay);
+    assert_eq!(ready_count(&control, &long_hold).await, 1);
+    assert_eq!(ready_count(&control, &short_hold).await, 1);
+
+    // The short retry comes back in about a second, not six.
+    let delivery = next_delivery(&mut stream, Duration::from_secs(4)).await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        delivery.envelope(),
+        &fast_next,
+        "the short retry returns first"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the short retry took {elapsed:?}; it was stuck behind the long one"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "the short retry came back after only {elapsed:?}"
+    );
+    delivery.ack().await.expect("ack");
+
+    // The long one is still waiting, and does come back eventually.
+    assert_eq!(ready_count(&control, &long_hold).await, 1);
+    let delivery = next_delivery(&mut stream, Duration::from_secs(10)).await;
+    assert_eq!(delivery.envelope(), &slow_next);
+    assert!(
+        started.elapsed() >= Duration::from_millis(5_900),
+        "the long retry came back early"
+    );
+    delivery.ack().await.expect("ack");
+
+    drop(stream);
+    backend.close().await.expect("close");
+    await_count(&control, &queue, 0).await;
+    cleanup(&control, &queue).await;
+    delete_queues(&control, &[long_hold, short_hold]).await;
+}
+
+#[tokio::test]
+async fn retries_and_deferrals_share_a_hold_queue_but_return_at_their_own_priority() {
+    let Some(url) = std::env::var("AMQP_URL").ok() else {
+        eprintln!("skipping: AMQP_URL not set");
+        return;
+    };
+
+    // Same rounded delay, same hold queue: the arguments depend only on the
+    // TTL. The priority rides on the message, so once both are back on `q`
+    // the deferral is served first even though it was published second.
+    let queue = unique_queue("retry-shared-hold");
+    let config = QueueConfig::new(queue.clone());
+    let backend = RabbitMqBackend::connect(&url).await.expect("connect");
+    let control = control(&url).await;
+    backend
+        .declare(std::slice::from_ref(&config))
+        .await
+        .expect("declare");
+
+    let retried = envelope(&queue, 1).next_attempt();
+    let deferred = envelope(&queue, 1).deferred(10);
+    assert_eq!(retried.priority, 0);
+    let delay = Duration::from_secs(1);
+    backend
+        .publish(&retried, Some(delay))
+        .await
+        .expect("delayed publish");
+    backend.defer(&deferred, delay).await.expect("defer");
+
+    let hold = hold_queue(&queue, delay);
+    assert_eq!(
+        ready_count(&control, &hold).await,
+        2,
+        "both wait in `{hold}`"
+    );
+
+    // Let both expire back onto `q` before consuming, so the order below is
+    // decided by priority and not by which one the broker moved first.
+    await_count(&control, &queue, 2).await;
+
+    let mut stream = backend.consume(&config).await.expect("consume");
+    let first = next_delivery(&mut stream, Duration::from_secs(5)).await;
+    assert_eq!(
+        first.envelope(),
+        &deferred,
+        "the deferral overtakes the retry"
+    );
+    first.ack().await.expect("ack");
+    let second = next_delivery(&mut stream, Duration::from_secs(5)).await;
+    assert_eq!(second.envelope(), &retried);
+    second.ack().await.expect("ack");
+
+    drop(stream);
+    backend.close().await.expect("close");
+    cleanup(&control, &queue).await;
+    delete_queues(&control, &[hold]).await;
+}
+
+#[tokio::test]
+async fn retry_granularity_is_separate_from_deferral_granularity() {
+    let Some(url) = std::env::var("AMQP_URL").ok() else {
+        eprintln!("skipping: AMQP_URL not set");
+        return;
+    };
+
+    // A coarse retry granularity bounds the number of hold queues a jittered
+    // backoff creates, without touching how precisely a deferral waits.
+    let queue = unique_queue("retry-granularity");
+    let config = QueueConfig::new(queue.clone());
+    let backend = RabbitMqBackend::with_options(
+        &url,
+        RabbitMqOptions::default()
+            .retry_granularity(Duration::from_secs(5))
+            .deferred_granularity(Duration::from_secs(1)),
+    )
+    .await
+    .expect("connect");
+    let control = control(&url).await;
+    backend
+        .declare(std::slice::from_ref(&config))
+        .await
+        .expect("declare");
+
+    let delay = Duration::from_millis(1_200);
+    backend
+        .publish(&envelope(&queue, 1), Some(delay))
+        .await
+        .expect("delayed publish");
+    backend
+        .defer(&envelope(&queue, 1).deferred(10), delay)
+        .await
+        .expect("defer");
+
+    // 1.2s rounds up to 5s for the retry path and to 2s for the deferral.
+    let retry_hold = backend.deferred_queue_name(&queue, 5_000);
+    let defer_hold = backend.deferred_queue_name(&queue, 2_000);
+    assert_eq!(
+        ready_count(&control, &retry_hold).await,
+        1,
+        "`{retry_hold}`"
+    );
+    assert_eq!(
+        ready_count(&control, &defer_hold).await,
+        1,
+        "`{defer_hold}`"
+    );
+
+    backend.close().await.expect("close");
+    cleanup(&control, &queue).await;
+    delete_queues(&control, &[retry_hold, defer_hold]).await;
+}
+
+#[tokio::test]
+async fn retrying_onto_an_undeclared_queue_is_refused() {
+    let Some(url) = std::env::var("AMQP_URL").ok() else {
+        eprintln!("skipping: AMQP_URL not set");
+        return;
+    };
+
+    // Same rule as for deferral, now that a delayed publish is a hold too: a
+    // backend that never declared the queue cannot know the hold queue's
+    // durability, and a TTL expiry into a missing queue is dropped silently.
+    let queue = unique_queue("retry-undeclared");
+    let backend = RabbitMqBackend::connect(&url).await.expect("connect");
+    let control = control(&url).await;
+
+    let error = backend
+        .publish(&envelope(&queue, 1), Some(Duration::from_secs(1)))
+        .await
+        .expect_err("a delayed publish onto an undeclared queue must fail");
+    assert!(
+        matches!(&error, Error::UnknownQueue(name) if name == &queue),
+        "expected UnknownQueue, got {error:?}"
+    );
+    let hold = hold_queue(&queue, Duration::from_secs(1));
+    assert!(
+        !queue_exists(&control, &hold).await,
+        "`{hold}` must not have been created"
+    );
+
+    backend.close().await.expect("close");
 }
 
 #[tokio::test]

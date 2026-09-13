@@ -13,7 +13,7 @@
 //! # async fn example() -> queuey_core::Result<()> {
 //! let backend = RabbitMqBackend::with_options(
 //!     "amqp://guest:guest@localhost:5672/%2f",
-//!     RabbitMqOptions::default().retry_suffix(".retry"),
+//!     RabbitMqOptions::default().retry_granularity(Duration::from_secs(5)),
 //! )
 //! .await?;
 //!
@@ -28,62 +28,86 @@
 //!
 //! # Topology
 //!
-//! Each logical queue `q` is backed by three broker queues, `q`, `q.retry` and
+//! Each logical queue `q` is backed by two long-lived broker queues, `q` and
 //! `q.dead`, plus a short-lived *hold* queue `q.deferred.{ttl_ms}` per distinct
-//! deferral delay. See [`topology`] for the exact arguments and for the
-//! head-of-line caveat that comes with TTL-based retry queues.
+//! delay. Every wait, whether a retry backoff, a delayed enqueue or a deferral,
+//! happens in a hold queue. See [`topology`] for the exact arguments.
 //!
-//! # Deferral
+//! # Why hold queues, and not one wait queue with per-message expirations
 //!
-//! [`Backend::defer`](queuey_core::Backend::defer) and
-//! [`Delivery::defer`](queuey_core::Delivery::defer) hold a job for a
-//! delay and then put it back on `q` **ahead of the backlog**. That is the shape a
-//! `429 Too Many Requests` with `Retry-After: 30` needs, where the job did not
-//! fail and must not burn an attempt.
+//! RabbitMQ only expires the message at the *head* of a classic queue. In a
+//! shared wait queue, a message with a five-minute `expiration` at the head
+//! holds back every one-second `expiration` queued behind it, and exponential
+//! backoff produces exactly that mix of delays. So instead the delay is part of
+//! the queue *name*, the wait is the queue-wide `x-message-ttl`, and every
+//! message in `q.deferred.30000` expires in publish order. A short wait is never
+//! stuck behind a long one, because the two live in different queues.
 //!
-//! Two mechanisms do that:
+//! Delays are rounded **up** to a granularity to bound how many hold queues
+//! exist at once: [`RabbitMqOptions::retry_granularity`] for retries and
+//! [`Producer::enqueue_after`](queuey_core::Producer::enqueue_after),
+//! [`RabbitMqOptions::deferred_granularity`] for deferrals, both `1s` by
+//! default. The hold queue is declared on demand right before each publish:
+//! an idle hold queue deletes itself one TTL after the last publish to it
+//! (`x-expires = 2 * TTL`), and every declare resets that timer.
 //!
-//! * **Hold queues.** A deferral is published to `q.deferred.{ttl_ms}`, a queue
-//!   whose whole purpose is to dead-letter its contents back onto `q` after
-//!   `ttl_ms`. The delay is the queue's `x-message-ttl`, never a per-message
-//!   `expiration`, so every message in it expires in publish order and short
-//!   deferrals are never stuck behind long ones. The delay is rounded up to
-//!   [`RabbitMqOptions::deferred_granularity`] (default `1s`) to bound how many
-//!   such queues exist, and the queue is declared on demand right before each
-//!   deferred publish: an idle hold queue deletes itself one TTL after the last
-//!   deferred publish to it (`x-expires = 2 * TTL`), and every declare resets
-//!   that timer.
-//! * **Priorities.** `q` is declared with `x-max-priority` from
+//! # Retry versus deferral
+//!
+//! Both wait in the same hold queues. They differ in what happens when the job
+//! is back on `q`:
+//!
+//! * A **retry** ([`Delivery::retry`](queuey_core::Delivery::retry), and a
+//!   delayed [`Backend::publish`](queuey_core::Backend::publish)) carries
+//!   priority `0` and joins the back of the queue like any other message. Its
+//!   attempt counter has been incremented.
+//! * A **deferral** ([`Backend::defer`](queuey_core::Backend::defer),
+//!   [`Delivery::defer`](queuey_core::Delivery::defer)) is what a
+//!   `429 Too Many Requests` with `Retry-After: 30` needs: the job did not fail,
+//!   must not burn an attempt, and must run **ahead of the backlog** when it
+//!   returns. `q` is declared with `x-max-priority` from
 //!   [`QueueConfig::max_priority`](queuey_core::QueueConfig::max_priority)
-//!   (default `Some(10)`), and every publish carries the envelope's `priority`.
-//!   Normal work is `0`; a deferred envelope carries the queue's top level, so
-//!   when it comes back it is served before everything that piled up meanwhile.
-//!   "Ahead of the backlog" means ahead of what is still *on* the queue: a
-//!   consumer with prefetch `N` already holds up to `N` backlog messages, and
-//!   the returning deferral is first among what is left.
+//!   (default `Some(10)`), every publish carries the envelope's `priority`, and a
+//!   deferred envelope carries the queue's top level, so it is served before
+//!   everything that piled up meanwhile. "Ahead of the backlog" means ahead of
+//!   what is still *on* the queue: a consumer with prefetch `N` already holds up
+//!   to `N` backlog messages, and the returning deferral is first among what is
+//!   left.
 //!
-//! ## What deferral requires
+//! ## What a hold requires
 //!
 //! * **The queue must have been declared through this backend, in this
 //!   process.** Otherwise the hold queue's durability and the queue it
 //!   dead-letters back to would be guesses, and a TTL expiry into a queue that
 //!   does not exist is discarded silently by the broker. Unlike a
-//!   `mandatory` publish, nothing comes back and nothing is logged. Deferring
+//!   `mandatory` publish, nothing comes back and nothing is logged. Holding
 //!   onto an unknown queue is
 //!   [`Error::UnknownQueue`](queuey_core::Error::UnknownQueue)
 //!   instead. `Producer::new` and `WorkerBuilder::build` declare the queue set;
-//!   `Producer::new_undeclared` deliberately does not.
+//!   `Producer::new_undeclared` deliberately does not, so a producer built that
+//!   way can enqueue, but not enqueue with a delay or defer.
 //! * **The delay must fit.** It is capped at
 //!   [`MAX_DEFERRAL_MS`](topology::MAX_DEFERRAL_MS), about 24.8 days. That is half of
 //!   what a 32-bit millisecond TTL can express, because the hold queue's
 //!   `x-expires` is twice its TTL. A longer delay is refused rather than
-//!   clamped: releasing a job early is the one thing a deferral promises not to
+//!   clamped: releasing a job early is the one thing a hold promises not to
 //!   do. Rounding up to the granularity happens first, so a delay just under the
 //!   cap can be refused too.
 //!
 //! Both failures happen *before* anything is acked, so from
+//! [`Delivery::retry`](queuey_core::Delivery::retry) and
 //! [`Delivery::defer`](queuey_core::Delivery::defer) they leave the
 //! original message unacknowledged and the broker redelivers it.
+//!
+//! ## Upgrading from the `q.retry` wait queue
+//!
+//! Earlier versions declared a `q.retry` queue per work queue and published
+//! retries into it with a per-message `expiration`. This version neither
+//! declares nor uses it. Nothing needs migrating: messages still waiting in an
+//! existing `q.retry` expire back onto `q` on their own, because the
+//! dead-letter routing is an argument of that queue, and workers running the
+//! old version keep declaring it themselves. Delete `q.retry` once it is empty
+//! and no old worker is left. `RabbitMqOptions::retry_suffix` is gone with it;
+//! [`RabbitMqOptions::retry_granularity`] is the retry tunable now.
 //!
 //! ## Breaking topology change
 //!
@@ -103,7 +127,7 @@
 //!   Deferral still works, it just returns jobs FIFO instead of ahead of the
 //!   queue.
 //!
-//! `q.retry`, `q.dead` and hold queues are unchanged, so only `q` is affected.
+//! `q.dead` and hold queues are unchanged, so only `q` is affected.
 //!
 //! # Guarantees
 //!
@@ -115,7 +139,8 @@
 //!   [`Delivery::defer`](queuey_core::Delivery::defer) and
 //!   [`Delivery::dead_letter`](queuey_core::Delivery::dead_letter)
 //!   publish first and ack second, and skip the ack entirely when the publish
-//!   fails, so a job is never lost. At worst it is redelivered. With
+//!   fails, so a job is never lost. At worst it is redelivered. Different
+//!   delays never block each other: each waits in its own hold queue. With
 //!   [`RabbitMqOptions::declare_dead_letter_queues`] off, `dead_letter` rejects
 //!   the delivery instead of publishing to a `q.dead` this backend does not own.
 //! * Messages whose body is not a valid [`queuey_core::Envelope`] are

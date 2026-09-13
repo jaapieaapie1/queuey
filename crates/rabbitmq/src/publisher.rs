@@ -38,19 +38,19 @@ use crate::{
 ///
 /// # Why declarations get their own channel
 ///
-/// [`publish_deferred`](Publisher::publish_deferred) has to declare a hold queue
-/// before it can publish into it, and a declaration is exactly the thing that
-/// can be *refused*: a hold queue that already exists with different arguments
-/// is answered with `PRECONDITION_FAILED`, which kills the channel it was issued
+/// [`publish_held`](Publisher::publish_held) has to declare a hold queue before
+/// it can publish into it, and a declaration is exactly the thing that can be
+/// *refused*: a hold queue that already exists with different arguments is
+/// answered with `PRECONDITION_FAILED`, which kills the channel it was issued
 /// on. On the shared confirm channel that would take down every concurrent
-/// publish with it (a retry, a dead-letter, an unrelated enqueue), and the
-/// declare's round trip would have to be waited out under the publish mutex,
-/// serialising publishers for the duration.
+/// publish with it (a dead-letter, an unrelated enqueue), and the declare's
+/// round trip would have to be waited out under the publish mutex, serialising
+/// publishers for the duration.
 ///
 /// So declarations run on a second, non-confirm channel with its own mutex.
-/// A refused declaration then costs exactly the one deferral that asked for it;
-/// the confirm channel never notices. Both channels are reopened lazily when the
-/// broker has closed them.
+/// A refused declaration then costs exactly the one retry or deferral that
+/// asked for it; the confirm channel never notices. Both channels are reopened
+/// lazily when the broker has closed them.
 #[derive(Clone)]
 pub(crate) struct Publisher {
     connection: Arc<Connection>,
@@ -62,9 +62,9 @@ pub(crate) struct Publisher {
     options: Arc<RabbitMqOptions>,
     /// Every [`QueueConfig`] this backend has declared, by queue name.
     ///
-    /// A deferral has to declare a hold queue, and a hold queue must be durable
-    /// exactly when its main queue is: a transient hold queue in front of a
-    /// durable work queue would silently lose held jobs on a broker restart.
+    /// A retry or deferral has to declare a hold queue, and a hold queue must be
+    /// durable exactly when its main queue is: a transient hold queue in front
+    /// of a durable work queue would silently lose held jobs on a broker restart.
     /// The publisher only ever sees an [`Envelope`], which carries a queue
     /// *name* and nothing else, so the backend records what it declared here and
     /// the publisher looks it up. Kept behind a plain `std` mutex: it is a
@@ -117,8 +117,8 @@ impl Publisher {
     /// into a missing queue is discarded by the broker silently, so the job
     /// would vanish an hour later with nothing reported anywhere.
     ///
-    /// [`publish_deferred`](Publisher::publish_deferred) therefore turns [`None`]
-    /// into [`Error::UnknownQueue`].
+    /// [`publish_held`](Publisher::publish_held) therefore turns [`None`] into
+    /// [`Error::UnknownQueue`].
     fn config_for(&self, queue: &str) -> Option<QueueConfig> {
         self.lock_configs().get(queue).cloned()
     }
@@ -149,17 +149,12 @@ impl Publisher {
         &self.options
     }
 
-    /// The retry queue for `queue`.
-    pub(crate) fn retry_queue(&self, queue: &str) -> String {
-        topology::retry_queue_name(queue, &self.options.retry_suffix)
-    }
-
     /// The dead-letter queue for `queue`.
     pub(crate) fn dead_queue(&self, queue: &str) -> String {
         topology::dead_queue_name(queue, &self.options.dead_suffix)
     }
 
-    /// The hold queue holding `ttl_ms`-long deferrals of `queue`.
+    /// The hold queue holding `ttl_ms`-long waits of `queue`.
     pub(crate) fn deferred_queue(&self, queue: &str, ttl_ms: u32) -> String {
         topology::deferred_queue_name(queue, &self.options.deferred_suffix, ttl_ms)
     }
@@ -200,7 +195,8 @@ impl Publisher {
     /// `PRECONDITION_FAILED`, which closes the channel. Doing that on the shared
     /// confirm channel would fail every publish in flight on it, and the
     /// declare's round trip would be waited out under the publish mutex. Here it
-    /// costs only the deferral that asked for it, plus one reopened channel.
+    /// costs only the retry or deferral that asked for it, plus one reopened
+    /// channel.
     async fn with_declare_channel(&self, context: &str) -> Result<MutexGuard<'_, Channel>> {
         let mut channel = self.declare_channel.lock().await;
         if !channel.status().connected() {
@@ -260,39 +256,37 @@ impl Publisher {
         Ok(())
     }
 
-    /// Publish `envelope` to its own queue, or to the retry queue when delayed.
-    pub(crate) async fn publish_envelope(
-        &self,
-        envelope: &Envelope,
-        delay: Option<Duration>,
-    ) -> Result<()> {
+    /// Publish `envelope` to its own queue, to be consumed as soon as possible.
+    pub(crate) async fn publish_envelope(&self, envelope: &Envelope) -> Result<()> {
         let payload = envelope.to_bytes()?;
-        let properties = codec::props_for(envelope, delay);
-        let target = match delay {
-            None => envelope.queue.clone(),
-            Some(_) => self.retry_queue(&envelope.queue),
-        };
-        self.publish_confirmed(&target, &payload, properties).await
+        let properties = codec::props_for(envelope);
+        self.publish_confirmed(&envelope.queue, &payload, properties)
+            .await
     }
 
     /// Publish `envelope` into the hold queue that releases it onto
     /// `envelope.queue` after `delay`.
     ///
-    /// The delay is rounded up to
-    /// [`deferred_granularity`](RabbitMqOptions::deferred_granularity) and that
-    /// rounded value names the hold queue, so equal delays share one strictly
+    /// Every wait goes through here: a retry backoff, a delayed enqueue and a
+    /// deferral alike. `hold` only decides which granularity the delay is
+    /// rounded up to ([`RabbitMqOptions::retry_granularity`] or
+    /// [`RabbitMqOptions::deferred_granularity`]) and how the publish is logged;
+    /// the hold queue and its arguments are the same for both, and the priority
+    /// the job returns with travels on the envelope.
+    ///
+    /// The rounded value names the hold queue, so equal delays share one strictly
     /// FIFO queue (see [`crate::topology`]).
     ///
-    /// The hold queue is declared **immediately before every deferred publish**
-    /// and the result is never cached. That is not laziness, it is the mechanism:
-    /// the queue carries `x-expires = 2 * ttl`, and an idempotent redeclare is
-    /// what resets that timer. An idle hold queue otherwise deletes itself one
-    /// TTL after the last deferred publish to it. Caching "I already declared
-    /// this" would let the broker delete a hold queue that is still in
-    /// occasional use, and the next `mandatory` publish would come back
-    /// unroutable, which, for a deferral from
-    /// [`Delivery::defer`](queuey_core::Delivery::defer), is at least a
-    /// safe failure: the original is not acked.
+    /// The hold queue is declared **immediately before every publish** and the
+    /// result is never cached. That is not laziness, it is the mechanism: the
+    /// queue carries `x-expires = 2 * ttl`, and an idempotent redeclare is what
+    /// resets that timer. An idle hold queue otherwise deletes itself one TTL
+    /// after the last publish to it. Caching "I already declared this" would let
+    /// the broker delete a hold queue that is still in occasional use, and the
+    /// next `mandatory` publish would come back unroutable, which, for a publish
+    /// from [`Delivery::retry`](queuey_core::Delivery::retry) or
+    /// [`Delivery::defer`](queuey_core::Delivery::defer), is at least a safe
+    /// failure: the original is not acked.
     ///
     /// The declaration runs on the dedicated declaration channel, never on the
     /// confirm channel every other publish shares; see
@@ -312,27 +306,28 @@ impl Publisher {
     ///
     /// Durability follows the main queue's, from the config the backend recorded
     /// at declare time.
-    pub(crate) async fn publish_deferred(
+    pub(crate) async fn publish_held(
         &self,
         envelope: &Envelope,
         delay: Duration,
+        hold: Hold,
     ) -> Result<()> {
         let Some(config) = self.config_for(&envelope.queue) else {
             return Err(Error::UnknownQueue(envelope.queue.clone()));
         };
-        let Some(ttl_ms) = topology::deferred_ttl_ms(delay, self.options.deferred_granularity)
-        else {
-            return Err(RabbitMqError::DeferralTooLong {
+        let granularity = hold.granularity(&self.options);
+        let Some(ttl_ms) = topology::deferred_ttl_ms(delay, granularity) else {
+            return Err(RabbitMqError::DelayTooLong {
                 requested: delay,
                 max: Duration::from_millis(u64::from(topology::MAX_DEFERRAL_MS)),
             }
             .into_core());
         };
-        let hold = self.deferred_queue(&envelope.queue, ttl_ms);
-        let hold_name = short_string(&hold)?;
+        let hold_queue = self.deferred_queue(&envelope.queue, ttl_ms);
+        let hold_name = short_string(&hold_queue)?;
 
         {
-            let channel = self.with_declare_channel(&hold).await?;
+            let channel = self.with_declare_channel(&hold_queue).await?;
             channel
                 .queue_declare(
                     hold_name,
@@ -347,15 +342,17 @@ impl Publisher {
 
         debug!(
             queue = %envelope.queue,
-            hold = %hold,
+            hold = %hold_queue,
             ttl_ms,
+            attempt = envelope.attempt,
             deferrals = envelope.deferrals,
             priority = envelope.priority,
-            "deferring job"
+            "{}",
+            hold.log_message()
         );
 
         let payload = envelope.to_bytes()?;
-        self.publish_confirmed(&hold, &payload, codec::deferred_props(envelope))
+        self.publish_confirmed(&hold_queue, &payload, codec::props_for(envelope))
             .await
     }
 
@@ -399,6 +396,39 @@ impl Publisher {
             close_channel(&channel).await
         };
         publishing.and(declaring)
+    }
+}
+
+/// Why a message is being put into a hold queue.
+///
+/// The hold queue itself does not care: its name and arguments depend only on
+/// the rounded delay. What differs is the *rounding*, because a retry backoff
+/// tolerates coarser steps than a `Retry-After` does, and the log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hold {
+    /// A retry backoff or a delayed enqueue: rounded to
+    /// [`RabbitMqOptions::retry_granularity`], returns at whatever priority the
+    /// envelope carries (`0` for both).
+    Retry,
+    /// A deferral: rounded to [`RabbitMqOptions::deferred_granularity`], returns
+    /// at the queue's top priority carried on the envelope.
+    Deferral,
+}
+
+impl Hold {
+    /// The step delays of this kind are rounded up to.
+    pub(crate) fn granularity(self, options: &RabbitMqOptions) -> Duration {
+        match self {
+            Self::Retry => options.retry_granularity,
+            Self::Deferral => options.deferred_granularity,
+        }
+    }
+
+    fn log_message(self) -> &'static str {
+        match self {
+            Self::Retry => "holding job for a delayed redelivery",
+            Self::Deferral => "deferring job",
+        }
     }
 }
 
@@ -462,17 +492,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn each_hold_kind_reads_its_own_granularity() {
+        let options = RabbitMqOptions::default()
+            .retry_granularity(Duration::from_secs(10))
+            .deferred_granularity(Duration::from_millis(250));
+        assert_eq!(Hold::Retry.granularity(&options), Duration::from_secs(10));
+        assert_eq!(
+            Hold::Deferral.granularity(&options),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
     fn a_plain_ack_is_success() {
         assert!(confirmation_to_result(Confirmation::Ack(None), "emails").is_ok());
     }
 
     #[test]
     fn a_nack_is_an_error_naming_the_queue() {
-        let err = confirmation_to_result(Confirmation::Nack(None), "emails.retry")
+        let err = confirmation_to_result(Confirmation::Nack(None), "emails.deferred.1000")
             .expect_err("nack must not be success");
         let text = err.to_string();
         assert!(text.contains("nacked"), "{text}");
-        assert!(text.contains("emails.retry"), "{text}");
+        assert!(text.contains("emails.deferred.1000"), "{text}");
     }
 
     #[test]

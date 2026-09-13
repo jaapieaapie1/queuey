@@ -8,10 +8,10 @@ RabbitMQ backend for [`queuey`](../..), built on [`lapin`](https://crates.io/cra
 * one publishing channel in confirm mode, shared behind a `tokio::sync::Mutex`.
   Every publish (enqueue, retry, defer, dead-letter) waits for the broker's
   confirmation. Nothing is ever *declared* on it;
-* one channel for the hold queue declarations `defer` makes on demand. A
-  declaration is the one thing the broker routinely refuses
-  (`PRECONDITION_FAILED` closes the channel it ran on), so it is kept away from
-  the publishes it would otherwise take down with it;
+* one channel for the hold queue declarations every retry, delayed enqueue and
+  `defer` makes on demand. A declaration is the one thing the broker routinely
+  refuses (`PRECONDITION_FAILED` closes the channel it ran on), so it is kept
+  away from the publishes it would otherwise take down with it;
 * one fresh channel per `consume` call, with `basic_qos(prefetch, global = false)`;
 * one throwaway channel per `declare`, so a rejected declaration cannot poison
   the other channels.
@@ -26,25 +26,27 @@ For each logical queue `q`:
 | queue | role | arguments |
 |---|---|---|
 | `q` | main work queue | `x-message-ttl` when `QueueConfig::message_ttl` is set, `x-max-priority` when `QueueConfig::max_priority` is `Some` |
-| `q.retry` | delay / wait queue | `x-dead-letter-exchange = ""`, `x-dead-letter-routing-key = q` |
 | `q.dead` | dead-letter queue | none |
-| `q.deferred.{ttl_ms}` | hold queue, one per deferral delay | `x-message-ttl = ttl_ms`, `x-dead-letter-exchange = ""`, `x-dead-letter-routing-key = q`, `x-expires = 2 * ttl_ms` |
+| `q.deferred.{ttl_ms}` | hold queue, one per distinct delay | `x-message-ttl = ttl_ms`, `x-dead-letter-exchange = ""`, `x-dead-letter-routing-key = q`, `x-expires = 2 * ttl_ms` |
 
-Delayed publishes and retries go to `q.retry` with a per-message `expiration`;
-when the message expires RabbitMQ routes it back to `q`. Because a classic queue
-only expires messages at its head, a long delay at the head can hold up shorter
-delays behind it. This is a known trade-off for v1.
+Every wait goes through a hold queue: a retry backoff, an `enqueue_after` delay
+and a deferral alike. There is no shared wait queue and no per-message
+`expiration`, because RabbitMQ only expires the message at the head of a classic
+queue: in a shared wait queue a five-minute retry at the head would hold back
+every one-second retry behind it, and exponential backoff produces exactly that
+mix. In a hold queue every message has the same TTL, so the queue drains in
+publish order and a short wait is never stuck behind a long one.
 
 Dead-lettered envelopes are published to `q.dead` with headers `x-death-reason`,
 `x-original-queue` and `x-attempts`. Bodies that do not decode as an `Envelope`
 are copied verbatim to `q.dead` with `x-death-reason = "malformed envelope"` and
 then acked, so one poison message cannot stall a consumer.
 
-`q`, `q.retry` and `q.dead` are created by `declare`. Hold queues are not: their
-names depend on the delays jobs actually ask for, so `defer` creates them on
-demand and the broker deletes them again once idle.
+`q` and `q.dead` are created by `declare`. Hold queues are not: their names
+depend on the delays jobs actually ask for, so they are created on demand right
+before each publish into them and the broker deletes them again once idle.
 
-The suffixes and whether `q.dead` is declared are configurable:
+The dead-letter suffix and whether `q.dead` is declared are configurable:
 
 ```rust
 use queuey_rabbitmq::{RabbitMqBackend, RabbitMqOptions};
@@ -52,49 +54,34 @@ use queuey_rabbitmq::{RabbitMqBackend, RabbitMqOptions};
 let backend = RabbitMqBackend::with_options(
     "amqp://guest:guest@localhost:5672/%2f",
     RabbitMqOptions::default()
-        .retry_suffix("-wait")
         .dead_suffix("-dlq")
         .declare_dead_letter_queues(true),
 )
 .await?;
 ```
 
-## Deferral
+## Hold queues
 
-`Backend::defer` and `Delivery::defer` hold a job for a delay and then put it
-back on `q` **ahead of the backlog**. That is what a `429 Too Many Requests` with
-`Retry-After: 30` calls for: the job did not fail and must not burn an
-attempt.
+A wait is published to `q.deferred.{ttl_ms}`, whose only job is to dead-letter
+its contents back onto `q` after `ttl_ms`. The delay is the queue's
+`x-message-ttl`, never a per-message `expiration`, so every message in one hold
+queue expires in publish order. The price is one queue per distinct delay, so
+delays are rounded **up** to a granularity; they are never rounded down, so a
+job is never released early.
 
-Two mechanisms do that:
+There are two granularities, because the two kinds of wait have different
+needs:
 
-* **Hold queues.** The deferral is published to `q.deferred.{ttl_ms}`, whose only
-  job is to dead-letter its contents back onto `q` after `ttl_ms`. The delay is
-  the queue's `x-message-ttl`, never a per-message `expiration`, so every message
-  in one hold queue expires in publish order: unlike `q.retry`, a short deferral
-  can never be stuck behind a long one. The price is one queue per distinct
-  delay, so delays are rounded **up** to `deferred_granularity` (default `1s`), so
-  `29.2s` and `30s` share `q.deferred.30000`. They are never rounded down, so a job
-  is never released early.
-* **Priorities.** `q` carries `x-max-priority` from `QueueConfig::max_priority`
-  (default `Some(10)`) and every publish carries the envelope's `priority`.
-  Normal work is `0`, a deferred envelope carries the queue's top level, so it is
-  served before everything that piled up while it waited. "Ahead of the backlog"
-  means ahead of what is still *on* the queue: a consumer with prefetch `N`
-  already holds up to `N` backlog messages, and the returning deferral is first
-  among what is still on the queue.
+| option | applies to | default |
+|---|---|---|
+| `retry_granularity` | `Delivery::retry` (backoff) and `enqueue_after` | `1s` |
+| `deferred_granularity` | `Delivery::defer` and `Producer::defer` | `1s` |
 
-The hold queue is declared immediately before *every* deferred publish and never
-cached: an idle hold queue deletes itself one TTL after the last deferred publish
-to it (`x-expires = 2 * TTL`), and every declare resets that timer. So a delay
-still in occasional use keeps its queue, and one that falls out of use is cleaned
-up by the broker.
-
-`x-expires` is deliberately **not** tunable. A hold queue's arguments are a pure
-function of its name, so two processes running different builds compute identical
-arguments for `q.deferred.30000`. Were the expiry a setting, a process with a
-different value would be answered `PRECONDITION_FAILED` on every deferral, for
-ever, with no way out but deleting the queue.
+A backoff is a heuristic and tolerates coarse rounding; a `Retry-After` is a
+contract. Exponential backoff with jitter produces a different delay on every
+retry, so `retry_granularity` is the knob that bounds how many hold queues a
+busy, failing queue can have at once: with a policy capped at five minutes,
+`1s` allows up to 300, `10s` up to 30.
 
 ```rust
 use std::time::Duration;
@@ -102,37 +89,84 @@ use queuey_rabbitmq::RabbitMqOptions;
 
 let options = RabbitMqOptions::default()
     .deferred_suffix(".deferred")                            // default
+    .retry_granularity(Duration::from_secs(10))              // default 1s
     .deferred_granularity(Duration::from_secs(1));           // default
 ```
 
-A zero `deferred_granularity` is clamped to one millisecond rather than
-rejected, because library code does not panic on configuration. It does mean up to one
-hold queue per distinct millisecond, which is almost never what you want.
+A zero granularity is clamped to one millisecond rather than rejected, because
+library code does not panic on configuration. It does mean up to one hold queue
+per distinct millisecond, which is almost never what you want.
 
-### What deferral requires
+The hold queue is declared immediately before *every* publish into it and never
+cached: an idle hold queue deletes itself one TTL after the last publish to it
+(`x-expires = 2 * TTL`), and every declare resets that timer. So a delay still
+in occasional use keeps its queue, and one that falls out of use is cleaned up
+by the broker.
+
+`x-expires` is deliberately **not** tunable. A hold queue's arguments are a pure
+function of its name, so two processes running different builds compute identical
+arguments for `q.deferred.30000`. Were the expiry a setting, a process with a
+different value would be answered `PRECONDITION_FAILED` on every publish, for
+ever, with no way out but deleting the queue. The granularities are safe to tune
+because they only change *which* hold queue a delay lands in, never that queue's
+arguments.
+
+### Retry versus deferral
+
+Both wait in the same hold queues; a retry and a deferral with the same rounded
+delay share one. They differ in what happens once the job is back on `q`:
+
+* A **retry** carries priority `0` and joins the back of the queue like any
+  other message. Its attempt counter has been incremented.
+* A **deferral** (`Backend::defer`, `Delivery::defer`) is what a
+  `429 Too Many Requests` with `Retry-After: 30` calls for: the job did not
+  fail, must not burn an attempt, and must come back **ahead of the backlog**.
+  `q` carries `x-max-priority` from `QueueConfig::max_priority` (default
+  `Some(10)`), every publish carries the envelope's `priority`, and a deferred
+  envelope carries the queue's top level, so it is served before everything that
+  piled up while it waited. "Ahead of the backlog" means ahead of what is still
+  *on* the queue: a consumer with prefetch `N` already holds up to `N` backlog
+  messages, and the returning deferral is first among what is still on the queue.
+
+### What a hold requires
 
 * **The queue must have been declared through this backend, in this process.**
   Otherwise the hold queue's durability and the queue it dead-letters back to
   would be guesses, and a TTL expiry into a queue that does not exist is
   discarded silently by the broker. Unlike a `mandatory` publish, nothing
-  is returned and nothing is logged. Deferring onto an unknown queue is
-  `Error::UnknownQueue` instead. `Producer::new` and `WorkerBuilder::build`
-  declare the queue set; `Producer::new_undeclared` deliberately does not, so a
-  producer built that way can enqueue but not defer.
+  is returned and nothing is logged. Retrying, delaying or deferring onto an
+  unknown queue is `Error::UnknownQueue` instead. `Producer::new` and
+  `WorkerBuilder::build` declare the queue set; `Producer::new_undeclared`
+  deliberately does not, so a producer built that way can `enqueue` but not
+  `enqueue_after` or `defer`.
 * **The delay must fit.** It is capped at `topology::MAX_DEFERRAL_MS`, about
   24.8 days. That is half of what a 32-bit millisecond TTL can express, because a hold
   queue's `x-expires` is twice its TTL. A longer delay is refused, not clamped:
-  releasing a job early is the one thing a deferral promises not to do. Rounding
+  releasing a job early is the one thing a hold promises not to do. Rounding
   up to the granularity happens first, so a delay just under the cap can be
   refused too.
 * **The queue name must leave room for its hold queues.** A 250-byte queue name
   is legal, but `{q}.deferred.2147483647` is not, so `declare` refuses such a
-  name up front rather than letting deferrals fail one job at a time later.
+  name up front rather than letting retries fail one job at a time later.
 
-All of these fail *before* anything is acked, so from `Delivery::defer` the
-original message stays unacknowledged and the broker redelivers it.
+All of these fail *before* anything is acked, so from `Delivery::retry` and
+`Delivery::defer` the original message stays unacknowledged and the broker
+redelivers it.
 
 ## Upgrading
+
+**`q.retry` is gone.** Earlier versions declared a `q.retry` wait queue per work
+queue and published retries into it with a per-message `expiration`. Retries
+now wait in the same hold queues as deferrals, so `declare` no longer creates
+`q.retry` and nothing publishes to it. No migration is needed: messages still
+waiting in an existing `q.retry` expire back onto `q` on their own, because the
+dead-letter routing is an argument of that queue, and workers on the old version
+keep declaring it themselves, so a mixed fleet keeps working. Delete `q.retry`
+once it is empty and no old worker is left. `RabbitMqOptions::retry_suffix` went
+with it; `retry_granularity` is the retry tunable now. Two behavioural changes
+come with the move: a delayed `enqueue_after` now needs the queue to have been
+declared through the same backend (as `defer` always did), and a retry delay
+past ~24.8 days is refused instead of being clamped.
 
 **`x-max-priority` is a breaking topology change.** It is a *declaration*
 argument, and RabbitMQ refuses to change the arguments of an existing queue: the
@@ -148,8 +182,7 @@ with the default config **will fail**. Two options:
   `#[queue(max_priority = 0)]`), which declares `q` exactly as before. Deferral
   still works; the returning job queues up FIFO with everything else.
 
-`q.retry`, `q.dead` and hold queues never carry `x-max-priority`, so only `q` is
-affected.
+`q.dead` and hold queues never carry `x-max-priority`, so only `q` is affected.
 
 **`RabbitMqOptions::deferred_queue_grace` is gone.** A hold queue's `x-expires`
 is now always `2 * TTL`, computed from the TTL in its name and nothing else. The

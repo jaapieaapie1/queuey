@@ -72,20 +72,21 @@ pub(crate) enum RabbitMqError {
         source: lapin::types::ShortStringError,
     },
 
-    /// A deferral asked for a delay longer than a hold queue can express.
+    /// A retry, delayed enqueue or deferral asked for a delay longer than a
+    /// hold queue can express.
     ///
     /// A hold queue times the wait with `x-message-ttl` and outlives it with
     /// `x-expires = 2 * ttl`, both 32-bit millisecond counts, so the longest
     /// holdable delay is
     /// [`MAX_DEFERRAL_MS`](crate::topology::MAX_DEFERRAL_MS) (~24.8 days).
     /// Anything longer is refused rather than shortened: releasing a job early
-    /// would break the one timing guarantee a deferral makes. Rounding up to the
+    /// would break the one timing guarantee a hold makes. Rounding up to the
     /// granularity happens first, so a delay just under the cap can be refused
     /// too.
     #[error(
-        "deferral of {requested:?} is longer than a hold queue can wait ({max:?}); it was refused rather than released early"
+        "delay of {requested:?} is longer than a hold queue can wait ({max:?}); it was refused rather than released early"
     )]
-    DeferralTooLong {
+    DelayTooLong {
         /// Delay the caller asked for.
         requested: std::time::Duration,
         /// Longest delay this backend can hold.
@@ -165,11 +166,11 @@ mod tests {
     #[test]
     fn nack_error_names_the_queue() {
         let err = RabbitMqError::Nacked {
-            queue: "emails.retry".to_owned(),
+            queue: "emails.deferred.1000".to_owned(),
         };
         assert_eq!(
             err.to_string(),
-            "broker nacked the message published to `emails.retry`"
+            "broker nacked the message published to `emails.deferred.1000`"
         );
     }
 
@@ -203,8 +204,8 @@ mod tests {
     }
 
     #[test]
-    fn deferral_too_long_says_it_was_refused_not_shortened() {
-        let err = RabbitMqError::DeferralTooLong {
+    fn delay_too_long_says_it_was_refused_not_shortened() {
+        let err = RabbitMqError::DelayTooLong {
             requested: std::time::Duration::from_secs(30 * 86_400),
             max: std::time::Duration::from_millis(u64::from(crate::topology::MAX_DEFERRAL_MS)),
         };

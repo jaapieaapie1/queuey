@@ -24,7 +24,7 @@ the derive macros from `queuey-macros`, and, behind the default `rabbitmq` featu
 
 ```toml
 [dependencies]
-queuey = "0.1"
+queuey = "0.2"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
@@ -251,9 +251,9 @@ cheaply clonable publisher pinned to that set.
 | method | effect |
 |---|---|
 | `enqueue(&job)` | publish now, returns the job id |
-| `enqueue_after(&job, delay)` | publish after `delay`, at normal priority; on RabbitMQ all delays of one queue share a wait queue |
-| `defer(&job, delay)` | hold for `delay`, then release at the queue's top priority; one hold per distinct delay, so delays never block each other |
-| `new_undeclared(backend)` | skip the declaration; the queues must already exist, and such a producer cannot `defer` |
+| `enqueue_after(&job, delay)` | publish after `delay`, at normal priority; one hold per distinct delay, so delays never block each other |
+| `defer(&job, delay)` | hold for `delay`, then release at the queue's top priority; same holds, different return priority |
+| `new_undeclared(backend)` | skip the declaration; the queues must already exist, and such a producer cannot `enqueue_after` or `defer` on RabbitMQ |
 
 ## Worker
 

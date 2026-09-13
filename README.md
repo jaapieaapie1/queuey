@@ -16,7 +16,7 @@ Type-safe job queues for Rust on RabbitMQ.
 
 ```toml
 [dependencies]
-queuey = "0.1"
+queuey = "0.2"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
@@ -152,8 +152,8 @@ have it arrive at the top when the delay is up:
 producer.defer(&CallApi { url }, Duration::from_secs(30)).await?;
 ```
 
-Contrast with `enqueue_after`, which shares one wait queue per queue (so different delays
-block each other head-of-line on RabbitMQ) and returns at priority `0`.
+Contrast with `enqueue_after`, which waits the same way but returns at priority `0`, behind
+the backlog.
 
 ### `max_priority`
 
@@ -180,23 +180,27 @@ enum AppQueues {
 
 * The main queue `q` is declared with `x-max-priority` when `max_priority` is set; every
   publish carries the AMQP `priority` property and an `x-deferrals` header.
-* Each deferral goes into a **hold queue per delay**, `q.deferred.<ttl_ms>` (e.g.
-  `myapp.emails.deferred.30000`), declared on demand right before the publish:
+* Each wait, deferral and retry alike, goes into a **hold queue per delay**,
+  `q.deferred.<ttl_ms>` (e.g. `myapp.emails.deferred.30000`), declared on demand right
+  before the publish:
   `x-message-ttl = ttl_ms`, dead-lettering back to `q`, and `x-expires = ttl_ms * 2` so an
   idle hold queue deletes itself. Both arguments follow from the name alone, so every
-  process declares the same queue identically. Delays are rounded up to a granularity (1s
-  by default), so `Retry-After: 30` and a 29.2s delay share one queue. Every message in a
-  hold queue has the same TTL, so it drains strictly in order: no head-of-line blocking
-  between delays.
+  process declares the same queue identically. Delays are rounded up to a granularity
+  (`deferred_granularity` for deferrals, `retry_granularity` for retries and
+  `enqueue_after`, both 1s by default), so `Retry-After: 30` and a 29.2s delay share one
+  queue. Every message in a hold queue has the same TTL, so it drains strictly in order: no
+  head-of-line blocking between delays, which is why retries use the same mechanism instead
+  of a shared wait queue with per-message expirations.
 * Hold queues are declared on their own channel, not on the one that publishes, so a
   declare the broker rejects cannot fail the publishes in flight beside it.
 * A delay may not exceed **about 24.8 days** (half of RabbitMQ's maximum TTL, which is what
   keeps `x-expires` above the TTL). A longer one is refused with an error rather than
   quietly released early.
-* The queue you defer onto has to have been declared through the same backend, the one
-  `Producer::new` or `WorkerBuilder::build` gave you. A `Producer::new_undeclared` cannot
-  defer: there would be no `q` for the hold queue to dead-letter into.
-* `q.retry` and `q.dead` are untouched by this, and hold queues never get a priority.
+* The queue you defer onto, or retry or `enqueue_after` on, has to have been declared
+  through the same backend, the one `Producer::new` or `WorkerBuilder::build` gave you. A
+  `Producer::new_undeclared` cannot defer or delay: there would be no `q` for the hold queue
+  to dead-letter into.
+* `q.dead` is untouched by this, and hold queues never get a priority.
 
 ### Upgrading an existing deployment
 

@@ -12,7 +12,7 @@ use tracing::warn;
 
 use crate::{
     error::{RabbitMqError, amqp},
-    publisher::Publisher,
+    publisher::{Hold, Publisher},
 };
 
 /// One RabbitMQ message, decoded into an [`Envelope`].
@@ -27,10 +27,10 @@ use crate::{
 /// [`dead_letter`](Delivery::dead_letter) publish *before* they ack, and
 /// propagate the publish error without acking, so a failure leaves the original
 /// message unacknowledged for the broker to redeliver rather than dropping the
-/// job. Because publishes are `mandatory`, a missing `q.retry` / `q.dead`
-/// counts as a failure. A hold queue cannot be missing: `defer` declares it
-/// itself, immediately before publishing, but that declaration can be
-/// *refused*, and [`defer`](Delivery::defer) says what happens then.
+/// job. Because publishes are `mandatory`, a missing `q.dead` counts as a
+/// failure. A hold queue cannot be missing: `retry` and `defer` declare it
+/// themselves, immediately before publishing, but that declaration can be
+/// *refused*, and [`retry`](Delivery::retry) says what happens then.
 ///
 /// When
 /// [`declare_dead_letter_queues`](crate::RabbitMqOptions::declare_dead_letter_queues)
@@ -137,19 +137,20 @@ impl Delivery for RabbitMqDelivery {
         self.ack_original().await
     }
 
-    async fn retry(self: Box<Self>, next: Envelope, delay: Duration) -> Result<()> {
-        self.publisher.publish_envelope(&next, Some(delay)).await?;
-        self.ack_original().await
-    }
-
-    /// Publish first, ack second, the same rule as [`retry`](Delivery::retry).
+    /// Publish first, ack second.
     ///
-    /// `next` is written into a hold queue (declared on the spot, `mandatory`,
-    /// waited on for a publisher confirm) and only once the broker has taken
-    /// responsibility for it is the original acked. If the publish fails the `?`
-    /// returns before the ack, so the original stays unacknowledged and the
-    /// broker redelivers it, so the job is retried rather than silently dropped.
-    /// The reverse order would lose a job on any broker hiccup between the two.
+    /// `next` is written into the hold queue for `delay` (declared on the spot,
+    /// `mandatory`, waited on for a publisher confirm) and only once the broker
+    /// has taken responsibility for it is the original acked. If the publish
+    /// fails the `?` returns before the ack, so the original stays
+    /// unacknowledged and the broker redelivers it, so the job is retried
+    /// rather than silently dropped. The reverse order would lose a job on any
+    /// broker hiccup between the two.
+    ///
+    /// The delay is rounded up to
+    /// [`RabbitMqOptions::retry_granularity`](crate::RabbitMqOptions::retry_granularity),
+    /// and `next` returns to `q` at the priority it carries, `0` after
+    /// [`Envelope::next_attempt`], so it joins the back of the queue.
     ///
     /// Three things count as that failure, and all three leave the original
     /// unacked (the worker counts a settle failure and the broker redelivers the
@@ -163,15 +164,31 @@ impl Delivery for RabbitMqDelivery {
     ///   ([`Error::UnknownQueue`](queuey_core::Error::UnknownQueue));
     /// * `delay` is longer than
     ///   [`MAX_DEFERRAL_MS`](crate::topology::MAX_DEFERRAL_MS) (~24.8 days),
-    ///   which is refused rather than shortened, because a deferral is never released
-    ///   early.
+    ///   which is refused rather than shortened, because a hold never releases
+    ///   a job early.
+    async fn retry(self: Box<Self>, next: Envelope, delay: Duration) -> Result<()> {
+        self.publisher
+            .publish_held(&next, delay, Hold::Retry)
+            .await?;
+        self.ack_original().await
+    }
+
+    /// Publish first, ack second, the same rule and the same failure modes as
+    /// [`retry`](Delivery::retry).
+    ///
+    /// The delay is rounded up to
+    /// [`RabbitMqOptions::deferred_granularity`](crate::RabbitMqOptions::deferred_granularity)
+    /// instead, and `next` carries its queue's top priority, so it returns
+    /// ahead of the backlog.
     ///
     /// A caveat on "ahead of the backlog": a consumer with prefetch `N` is
     /// already holding up to `N` messages of that backlog, and the returning
     /// deferral cannot overtake those. It is first among what is still on the
     /// queue.
     async fn defer(self: Box<Self>, next: Envelope, delay: Duration) -> Result<()> {
-        self.publisher.publish_deferred(&next, delay).await?;
+        self.publisher
+            .publish_held(&next, delay, Hold::Deferral)
+            .await?;
         self.ack_original().await
     }
 }

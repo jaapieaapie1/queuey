@@ -55,13 +55,14 @@ pub trait Backend: Send + Sync + 'static {
     /// `delay`. This is the publish half of [`Delivery::defer`], also used by
     /// [`crate::Producer::defer`].
     ///
-    /// Differs from `publish` with a delay: that one shares a single wait queue per
-    /// queue (on RabbitMQ `q.retry`, where mixed per-message TTLs block each other at
-    /// the head) and the message returns with whatever priority it carries. A deferral
-    /// is held per delay, so equal delays drain strictly in order, and the envelope is
-    /// expected to carry the queue's top priority so it overtakes the backlog.
+    /// Differs from `publish` with a delay only in intent, and backends may treat
+    /// the two differently in detail: a deferral is expected to carry its queue's
+    /// top priority so it overtakes the backlog when it returns, and on RabbitMQ the
+    /// delay is rounded to a separate, typically finer, granularity because a
+    /// `Retry-After` is a contract while a backoff is a heuristic. Neither path
+    /// releases a job early, and neither lets different delays block each other.
     ///
-    /// Hold queue naming and lifetime are backend-specific.
+    /// Hold naming and lifetime are backend-specific.
     async fn defer(&self, envelope: &Envelope, delay: Duration) -> Result<()>;
 
     /// Start consuming `queue` with the given prefetch. The stream ends when the

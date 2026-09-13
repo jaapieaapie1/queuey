@@ -4,10 +4,11 @@ use std::time::Duration;
 
 use lapin::ConnectionProperties;
 
-use crate::topology::{DEFAULT_DEAD_SUFFIX, DEFAULT_DEFERRED_SUFFIX, DEFAULT_RETRY_SUFFIX};
+use crate::topology::{DEFAULT_DEAD_SUFFIX, DEFAULT_DEFERRED_SUFFIX};
 
-/// Default for [`RabbitMqOptions::deferred_granularity`].
-const DEFAULT_DEFERRED_GRANULARITY: Duration = Duration::from_secs(1);
+/// Default for [`RabbitMqOptions::retry_granularity`] and
+/// [`RabbitMqOptions::deferred_granularity`].
+const DEFAULT_GRANULARITY: Duration = Duration::from_secs(1);
 
 /// Configuration for [`RabbitMqBackend::with_options`](crate::RabbitMqBackend::with_options).
 ///
@@ -15,20 +16,14 @@ const DEFAULT_DEFERRED_GRANULARITY: Duration = Duration::from_secs(1);
 /// use queuey_rabbitmq::RabbitMqOptions;
 ///
 /// let options = RabbitMqOptions::default()
-///     .retry_suffix("-wait")
 ///     .dead_suffix("-dlq")
 ///     .declare_dead_letter_queues(false);
-/// assert_eq!(options.retry_suffix, "-wait");
+/// assert_eq!(options.dead_suffix, "-dlq");
 /// ```
 #[derive(Clone, Debug)]
 pub struct RabbitMqOptions {
     /// Handshake properties passed to `lapin::Connection::connect`.
     pub connection_properties: ConnectionProperties,
-
-    /// Suffix appended to a queue name to name its retry (wait) queue.
-    ///
-    /// Defaults to [`DEFAULT_RETRY_SUFFIX`] (`".retry"`).
-    pub retry_suffix: String,
 
     /// Suffix appended to a queue name to name its dead-letter queue.
     ///
@@ -60,9 +55,36 @@ pub struct RabbitMqOptions {
     /// Infix between a queue name and a hold queue's TTL.
     ///
     /// Defaults to [`DEFAULT_DEFERRED_SUFFIX`] (`".deferred"`), so a 30-second
-    /// deferral of `myapp.emails` waits in `myapp.emails.deferred.30000`. See
+    /// wait on `myapp.emails` happens in `myapp.emails.deferred.30000`. Retries,
+    /// delayed enqueues and deferrals all wait in these hold queues; see
     /// [`crate::topology`] for why the TTL is part of the name.
     pub deferred_suffix: String,
+
+    /// Step that retry backoffs and
+    /// [`Producer::enqueue_after`](queuey_core::Producer::enqueue_after) delays
+    /// are rounded **up** to.
+    ///
+    /// Defaults to one second. Every distinct rounded delay gets its own hold
+    /// queue, so this is the knob that trades backoff precision for the number
+    /// of queues on the broker. It matters most for exponential backoff with
+    /// jitter, which produces a different delay for every retry: with the
+    /// default, a policy capped at five minutes can create at most 300 hold
+    /// queues per work queue, and a granularity of ten seconds brings that down
+    /// to 30. Idle hold queues delete themselves, so this bounds the number that
+    /// exist at once, not a total.
+    ///
+    /// Separate from [`deferred_granularity`](Self::deferred_granularity) on
+    /// purpose: a backoff is a heuristic that tolerates coarse rounding, a
+    /// `Retry-After` is a contract that may not.
+    ///
+    /// A retry is never released *early*: rounding is always up, a delay
+    /// shorter than the granularity still waits one full step, and a delay that
+    /// rounds up past
+    /// [`MAX_DEFERRAL_MS`](crate::topology::MAX_DEFERRAL_MS) (~24.8 days) is
+    /// refused instead of being shortened. A zero (or sub-millisecond) value is
+    /// clamped to one millisecond rather than rejected, exactly as for
+    /// [`deferred_granularity`](Self::deferred_granularity).
+    pub retry_granularity: Duration,
 
     /// Step that deferral delays are rounded **up** to.
     ///
@@ -87,9 +109,9 @@ pub struct RabbitMqOptions {
     /// Note what is *not* here: nothing tunes a hold queue's `x-expires`. Its
     /// arguments are a pure function of its name (`x-expires = 2 * ttl`), so two
     /// processes configured differently still agree on `q.deferred.30000`
-    /// instead of locking each other out with `PRECONDITION_FAILED`. The
-    /// granularity is safe to tune because it only changes *which* hold queue a
-    /// delay lands in, never that queue's arguments.
+    /// instead of locking each other out with `PRECONDITION_FAILED`. Both
+    /// granularities are safe to tune because they only change *which* hold
+    /// queue a delay lands in, never that queue's arguments.
     pub deferred_granularity: Duration,
 }
 
@@ -97,11 +119,11 @@ impl Default for RabbitMqOptions {
     fn default() -> Self {
         Self {
             connection_properties: ConnectionProperties::default(),
-            retry_suffix: DEFAULT_RETRY_SUFFIX.to_owned(),
             dead_suffix: DEFAULT_DEAD_SUFFIX.to_owned(),
             declare_dead_letter_queues: true,
             deferred_suffix: DEFAULT_DEFERRED_SUFFIX.to_owned(),
-            deferred_granularity: DEFAULT_DEFERRED_GRANULARITY,
+            retry_granularity: DEFAULT_GRANULARITY,
+            deferred_granularity: DEFAULT_GRANULARITY,
         }
     }
 }
@@ -111,13 +133,6 @@ impl RabbitMqOptions {
     #[must_use]
     pub fn connection_properties(mut self, properties: ConnectionProperties) -> Self {
         self.connection_properties = properties;
-        self
-    }
-
-    /// Replace the retry queue suffix.
-    #[must_use]
-    pub fn retry_suffix(mut self, suffix: impl Into<String>) -> Self {
-        self.retry_suffix = suffix.into();
         self
     }
 
@@ -142,6 +157,17 @@ impl RabbitMqOptions {
         self
     }
 
+    /// Replace the step retry backoffs and delayed enqueues are rounded up to.
+    ///
+    /// A zero or sub-millisecond value is *clamped* to one millisecond when the
+    /// TTL is computed, not rejected here: this is a builder, and library code
+    /// does not panic on configuration.
+    #[must_use]
+    pub fn retry_granularity(mut self, granularity: Duration) -> Self {
+        self.retry_granularity = granularity;
+        self
+    }
+
     /// Replace the step deferral delays are rounded up to.
     ///
     /// A zero or sub-millisecond value is *clamped* to one millisecond when the
@@ -161,10 +187,10 @@ mod tests {
     #[test]
     fn defaults_match_the_documented_topology() {
         let options = RabbitMqOptions::default();
-        assert_eq!(options.retry_suffix, ".retry");
         assert_eq!(options.dead_suffix, ".dead");
         assert!(options.declare_dead_letter_queues);
         assert_eq!(options.deferred_suffix, ".deferred");
+        assert_eq!(options.retry_granularity, Duration::from_secs(1));
         assert_eq!(options.deferred_granularity, Duration::from_secs(1));
     }
 
@@ -176,8 +202,16 @@ mod tests {
         assert_eq!(options.deferred_suffix, "-hold");
         assert_eq!(options.deferred_granularity, Duration::from_millis(250));
         // And they are independent of the retry / dead-letter tunables.
-        assert_eq!(options.retry_suffix, ".retry");
+        assert_eq!(options.retry_granularity, Duration::from_secs(1));
         assert_eq!(options.dead_suffix, ".dead");
+    }
+
+    #[test]
+    fn retry_granularity_is_independent_of_the_deferral_granularity() {
+        // Coarsening backoff rounding must not touch `Retry-After` precision.
+        let options = RabbitMqOptions::default().retry_granularity(Duration::from_secs(10));
+        assert_eq!(options.retry_granularity, Duration::from_secs(10));
+        assert_eq!(options.deferred_granularity, Duration::from_secs(1));
     }
 
     #[test]
@@ -197,10 +231,10 @@ mod tests {
     #[test]
     fn suffixes_can_be_overridden() {
         let options = RabbitMqOptions::default()
-            .retry_suffix("-wait")
-            .dead_suffix("-dlq");
-        assert_eq!(options.retry_suffix, "-wait");
+            .dead_suffix("-dlq")
+            .deferred_suffix("-hold");
         assert_eq!(options.dead_suffix, "-dlq");
+        assert_eq!(options.deferred_suffix, "-hold");
         assert!(options.declare_dead_letter_queues);
     }
 

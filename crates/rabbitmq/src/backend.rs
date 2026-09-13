@@ -27,7 +27,7 @@ use crate::{
     delivery::RabbitMqDelivery,
     error::{RabbitMqError, amqp, short_string},
     options::RabbitMqOptions,
-    publisher::Publisher,
+    publisher::{Hold, Publisher},
     topology,
 };
 
@@ -42,11 +42,11 @@ const REPLY_SUCCESS: u16 = 200;
 ///   is `mandatory` and waits for the broker's confirmation. The channel is
 ///   reopened lazily if a channel exception closed it. Nothing is ever
 ///   *declared* on it.
-/// * One long-lived [`Channel`] for the hold queue declarations
-///   [`defer`](Backend::defer) makes on demand. A declaration is the one thing
-///   the broker routinely refuses (`PRECONDITION_FAILED` closes the channel it
-///   ran on), so it is kept away from the publishes it would otherwise take down
-///   with it.
+/// * One long-lived [`Channel`] for the hold queue declarations every retry,
+///   delayed publish and [`defer`](Backend::defer) makes on demand. A
+///   declaration is the one thing the broker routinely refuses
+///   (`PRECONDITION_FAILED` closes the channel it ran on), so it is kept away
+///   from the publishes it would otherwise take down with it.
 /// * One fresh [`Channel`] per [`consume`](Backend::consume) call, so each
 ///   consumer gets its own `basic_qos` prefetch window and a failure on one
 ///   consumer cannot take down the others.
@@ -119,23 +119,17 @@ impl RabbitMqBackend {
         &self.options
     }
 
-    /// The name of the retry (wait) queue backing `queue`.
-    #[must_use]
-    pub fn retry_queue_name(&self, queue: &str) -> String {
-        topology::retry_queue_name(queue, &self.options.retry_suffix)
-    }
-
     /// The name of the dead-letter queue backing `queue`.
     #[must_use]
     pub fn dead_queue_name(&self, queue: &str) -> String {
         topology::dead_queue_name(queue, &self.options.dead_suffix)
     }
 
-    /// The name of the hold queue that `ttl_ms`-long deferrals of `queue` wait in.
+    /// The name of the hold queue that `ttl_ms`-long waits of `queue` happen in.
     ///
-    /// There is one per distinct rounded delay, and it is created on demand by
-    /// [`defer`](Backend::defer) rather than by [`declare`](Backend::declare);
-    /// see [`topology`].
+    /// There is one per distinct rounded delay, shared by retries and
+    /// deferrals, and it is created on demand by whatever schedules the wait
+    /// rather than by [`declare`](Backend::declare); see [`topology`].
     #[must_use]
     pub fn deferred_queue_name(&self, queue: &str, ttl_ms: u32) -> String {
         topology::deferred_queue_name(queue, &self.options.deferred_suffix, ttl_ms)
@@ -146,27 +140,19 @@ impl RabbitMqBackend {
         topology::declare_options(durable)
     }
 
-    /// Declare `q`, `q.retry` and (optionally) `q.dead` on `channel`.
+    /// Declare `q` and (optionally) `q.dead` on `channel`.
     ///
     /// Hold queues are *not* declared here: their names depend on the delays
     /// jobs actually ask for, so they are created on demand by
-    /// [`defer`](Backend::defer) and deleted again by the broker once idle.
+    /// [`publish`](Backend::publish) with a delay, [`defer`](Backend::defer)
+    /// and the delivery's `retry` / `defer`, and deleted again by the broker
+    /// once idle.
     async fn declare_one(&self, channel: &Channel, config: &QueueConfig) -> Result<()> {
         channel
             .queue_declare(
                 short_string(&config.name)?,
                 Self::declare_options(config.durable),
                 topology::queue_args(config),
-            )
-            .await
-            .map_err(amqp)?;
-
-        let retry = self.retry_queue_name(&config.name);
-        channel
-            .queue_declare(
-                short_string(&retry)?,
-                Self::declare_options(config.durable),
-                topology::retry_queue_args(config),
             )
             .await
             .map_err(amqp)?;
@@ -185,9 +171,9 @@ impl RabbitMqBackend {
                 .map_err(amqp)?;
         }
 
-        // Only after the declarations landed: a deferral onto this queue now
-        // knows whether its hold queue has to be durable, and with how many
-        // priority levels the returning job will be ordered.
+        // Only after the declarations landed: a retry or deferral onto this
+        // queue now knows whether its hold queue has to be durable, and with how
+        // many priority levels the returning job will be ordered.
         self.publisher.remember(config);
 
         debug!(queue = %config.name, "topology declared");
@@ -202,9 +188,9 @@ impl Backend for RabbitMqBackend {
             return Ok(());
         }
         // Up front, before a single queue exists: a name that leaves no room for
-        // its hold queues would otherwise declare fine and then fail one
-        // deferral at a time, in production, on the day someone picks a long
-        // delay. Nothing is created when this fails.
+        // its hold queues would otherwise declare fine and then fail one retry
+        // at a time, in production, on the day someone picks a long delay.
+        // Nothing is created when this fails.
         for config in queues {
             check_deferrable_name(&config.name, &self.options.deferred_suffix)?;
         }
@@ -226,8 +212,26 @@ impl Backend for RabbitMqBackend {
         result
     }
 
+    /// Publish `envelope` to its queue, or with `delay` into the hold queue
+    /// that releases it onto its queue afterwards.
+    ///
+    /// A delayed publish is held exactly like a retry: the delay is rounded up
+    /// to [`retry_granularity`](RabbitMqOptions::retry_granularity), the job
+    /// returns at the priority the envelope carries (`0` for a fresh envelope,
+    /// so it joins the back of the queue), and the same two rules as for
+    /// [`defer`](Backend::defer) apply: the queue must have been declared
+    /// through this backend, and the delay must not exceed
+    /// [`MAX_DEFERRAL_MS`](topology::MAX_DEFERRAL_MS). An undelayed publish
+    /// has neither restriction.
     async fn publish(&self, envelope: &Envelope, delay: Option<Duration>) -> Result<()> {
-        self.publisher.publish_envelope(envelope, delay).await
+        match delay {
+            None => self.publisher.publish_envelope(envelope).await,
+            Some(delay) => {
+                self.publisher
+                    .publish_held(envelope, delay, Hold::Retry)
+                    .await
+            }
+        }
     }
 
     /// Hold `envelope` for `delay`, then put it back on its own queue.
@@ -246,7 +250,8 @@ impl Backend for RabbitMqBackend {
     /// `Producer::new` and `WorkerBuilder::build` declare the whole queue set,
     /// so anything built through them can defer. `Producer::new_undeclared`
     /// deliberately does not, so a producer built that way can enqueue but
-    /// cannot defer until something in the process declares the queue.
+    /// cannot defer, or enqueue with a delay, until something in the process
+    /// declares the queue.
     ///
     /// # The delay has a ceiling
     ///
@@ -257,7 +262,9 @@ impl Backend for RabbitMqBackend {
     ///
     /// [`Error::UnknownQueue`]: queuey_core::Error::UnknownQueue
     async fn defer(&self, envelope: &Envelope, delay: Duration) -> Result<()> {
-        self.publisher.publish_deferred(envelope, delay).await
+        self.publisher
+            .publish_held(envelope, delay, Hold::Deferral)
+            .await
     }
 
     async fn consume(&self, queue: &QueueConfig) -> Result<DeliveryStream> {
