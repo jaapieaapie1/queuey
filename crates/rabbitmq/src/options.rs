@@ -1,10 +1,13 @@
 //! Tunables for [`RabbitMqBackend`](crate::RabbitMqBackend).
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use lapin::ConnectionProperties;
 
-use crate::topology::{DEFAULT_DEAD_SUFFIX, DEFAULT_DEFERRED_SUFFIX};
+use crate::{
+    reconnect::{ReconnectPolicy, default_policy},
+    topology::{DEFAULT_DEAD_SUFFIX, DEFAULT_DEFERRED_SUFFIX},
+};
 
 /// Default for [`RabbitMqOptions::retry_granularity`] and
 /// [`RabbitMqOptions::deferred_granularity`].
@@ -113,6 +116,38 @@ pub struct RabbitMqOptions {
     /// granularities are safe to tune because they only change *which* hold
     /// queue a delay lands in, never that queue's arguments.
     pub deferred_granularity: Duration,
+
+    /// How a lost connection is recovered, or [`None`] to fail instead.
+    ///
+    /// Defaults to [`BackoffPolicy::default`](crate::BackoffPolicy): retry
+    /// forever with a jittered exponential backoff. Any
+    /// [`ReconnectPolicy`] implementation can go here, so pacing that a backoff
+    /// curve cannot express (a circuit breaker, a schedule, a different answer
+    /// for an authentication failure than for a refused connection) is a matter
+    /// of writing one. A dropped connection is then invisible to job code
+    /// and to [`Worker::run`](queuey_core::Worker::run), which keeps running:
+    /// publishes wait for the connection to come back, and consumers
+    /// resubscribe on it.
+    ///
+    /// Two consequences worth knowing before relying on it:
+    ///
+    /// * **A broker that never comes back looks like a stall, not an error.**
+    ///   With the default unlimited policy nothing ever returns
+    ///   `Err`; the reconnect attempts are logged at `WARN`. Set
+    ///   [`BackoffPolicy::max_attempts`](crate::BackoffPolicy::max_attempts) if
+    ///   the worker should exit instead.
+    /// * **Jobs in flight across an outage are redelivered.** The broker
+    ///   requeues everything that was unacknowledged when the connection went
+    ///   down, so a job whose handler was still running is run again on the new
+    ///   connection, and the settle its first run eventually attempts fails
+    ///   (counted by
+    ///   [`WorkerHandle::settle_failures`](queuey_core::WorkerHandle::settle_failures)).
+    ///   That is the at-least-once contract this backend already has, but an
+    ///   outage is when it actually bites.
+    ///
+    /// Set to [`None`] for the original behaviour: the connection is not
+    /// rebuilt, consumer streams end, and `Worker::run` returns an error.
+    pub reconnect: Option<Arc<dyn ReconnectPolicy>>,
 }
 
 impl Default for RabbitMqOptions {
@@ -124,6 +159,7 @@ impl Default for RabbitMqOptions {
             deferred_suffix: DEFAULT_DEFERRED_SUFFIX.to_owned(),
             retry_granularity: DEFAULT_GRANULARITY,
             deferred_granularity: DEFAULT_GRANULARITY,
+            reconnect: Some(default_policy()),
         }
     }
 }
@@ -178,6 +214,64 @@ impl RabbitMqOptions {
         self.deferred_granularity = granularity;
         self
     }
+
+    /// Replace the reconnection policy, or pass [`None`] to disable
+    /// reconnection entirely.
+    ///
+    /// Takes anything that is already an [`Arc<dyn ReconnectPolicy>`]; use
+    /// [`reconnect_with`](Self::reconnect_with) to pass a policy by value.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use queuey_rabbitmq::{BackoffPolicy, RabbitMqOptions, ReconnectPolicy};
+    ///
+    /// let policy: Arc<dyn ReconnectPolicy> =
+    ///     Arc::new(BackoffPolicy::default().max_attempts(Some(5)));
+    /// let bounded = RabbitMqOptions::default().reconnect(Some(policy));
+    /// assert!(bounded.reconnect.is_some());
+    ///
+    /// // Or fail fast, as this backend did before reconnection existed.
+    /// let never = RabbitMqOptions::default().reconnect(None);
+    /// assert!(never.reconnect.is_none());
+    /// ```
+    ///
+    /// [`Arc<dyn ReconnectPolicy>`]: ReconnectPolicy
+    #[must_use]
+    pub fn reconnect(mut self, policy: Option<Arc<dyn ReconnectPolicy>>) -> Self {
+        self.reconnect = policy;
+        self
+    }
+
+    /// Reconnect according to `policy`, wrapping it for you.
+    ///
+    /// The common case: the backend stores policies behind an [`Arc`] because
+    /// every consumer and publisher consults the same one, but a caller building
+    /// options should not have to say so.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use queuey_rabbitmq::{Attempt, BackoffPolicy, RabbitMqOptions, ReconnectPolicy};
+    ///
+    /// // The built-in policy, tuned.
+    /// let bounded = RabbitMqOptions::default()
+    ///     .reconnect_with(BackoffPolicy::default().max_attempts(Some(5)));
+    ///
+    /// // Or one of your own.
+    /// #[derive(Debug)]
+    /// struct EverySecond;
+    /// impl ReconnectPolicy for EverySecond {
+    ///     fn next_delay(&self, _: Attempt<'_>) -> Option<Duration> {
+    ///         Some(Duration::from_secs(1))
+    ///     }
+    /// }
+    /// let steady = RabbitMqOptions::default().reconnect_with(EverySecond);
+    /// assert!(steady.reconnect.is_some());
+    /// ```
+    #[must_use]
+    pub fn reconnect_with(mut self, policy: impl ReconnectPolicy + 'static) -> Self {
+        self.reconnect = Some(Arc::new(policy));
+        self
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +286,53 @@ mod tests {
         assert_eq!(options.deferred_suffix, ".deferred");
         assert_eq!(options.retry_granularity, Duration::from_secs(1));
         assert_eq!(options.deferred_granularity, Duration::from_secs(1));
+        assert!(
+            options.reconnect.is_some(),
+            "a dropped connection is recovered by default"
+        );
+    }
+
+    #[test]
+    fn reconnection_can_be_bounded_or_turned_off() {
+        use crate::reconnect::{Attempt, BackoffPolicy, Rebuilding};
+
+        let bounded = RabbitMqOptions::default()
+            .reconnect_with(BackoffPolicy::default().max_attempts(Some(1)));
+        let policy = bounded.reconnect.expect("a policy");
+        assert!(
+            policy
+                .next_delay(Attempt::first(Rebuilding::Connection))
+                .is_some(),
+            "one attempt is allowed"
+        );
+
+        let never = RabbitMqOptions::default().reconnect(None);
+        assert!(never.reconnect.is_none());
+        // Turning it off must not disturb the rest of the configuration.
+        assert_eq!(never.dead_suffix, ".dead");
+        assert_eq!(never.retry_granularity, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_custom_policy_can_replace_the_built_in_one() {
+        use crate::reconnect::Attempt;
+
+        #[derive(Debug)]
+        struct Never;
+        impl ReconnectPolicy for Never {
+            fn next_delay(&self, _: Attempt<'_>) -> Option<Duration> {
+                None
+            }
+        }
+
+        let options = RabbitMqOptions::default().reconnect_with(Never);
+        let policy = options.reconnect.expect("a policy");
+        assert_eq!(
+            policy.next_delay(Attempt::first(crate::reconnect::Rebuilding::Connection)),
+            None
+        );
+        // `Debug` survives into the options, so configuration stays printable.
+        assert!(format!("{policy:?}").contains("Never"));
     }
 
     #[test]

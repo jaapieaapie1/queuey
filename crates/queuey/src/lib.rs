@@ -158,7 +158,10 @@ pub use queuey_core::*;
 pub use queuey_macros::{Job, Queues};
 
 #[cfg(feature = "rabbitmq")]
-pub use queuey_rabbitmq::{self as rabbitmq, RabbitMqBackend, RabbitMqOptions};
+pub use queuey_rabbitmq::{
+    self as rabbitmq, Attempt, BackoffPolicy, RabbitMqBackend, RabbitMqOptions, Rebuilding,
+    ReconnectPolicy,
+};
 
 /// The core crate, re-exported for generated code. Not part of the public API.
 #[doc(hidden)]

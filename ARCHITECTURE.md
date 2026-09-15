@@ -140,7 +140,55 @@ plus `#[allow(clippy::approx_constant)]` for `factor` literals such as `3.141592
   `message_id = job_id`, `type = job_type`.
 - Connection: single `lapin::Connection`, one channel for publishing (confirm mode), one channel
   for hold queue declarations, one channel per consumer.
-- Reconnect is **out of scope for v1**; stream ends on connection loss, `Worker::run` returns `Err`.
+- Reconnect: the connection is a slot, not a socket. A drop is repaired by whichever
+  operation notices first, single-flight behind a mutex, paced by a `ReconnectPolicy`
+  (default `BackoffPolicy`: unlimited, jittered exponential, 500ms base, capped at 30s).
+  See the Reconnection section.
+
+## Reconnection
+
+- **Scope.** Everything below the `Backend` trait. `Producer`, `Worker` and job handlers
+  are unchanged and see no new error; a dropped connection is a pause, not a failure.
+- **Single-flight.** Publishers, declarers and consumers all call
+  `ConnectionHandle::ensure_connected`; one of them reconnects while the rest queue behind
+  a mutex. N consumers on a backend do not become N connections.
+- **Generation.** A counter of successful connections, bumped after the swap. A consumer
+  records it when it subscribes, so it can tell "my connection died" from "somebody already
+  replaced it".
+- **Replay.** Every `QueueConfig` passed to `declare` is remembered on the handle, and
+  re-declared on the new connection (`declare_topology`, shared with `declare` itself so
+  the two cannot drift). A broker that *restarted* has lost every non-durable queue and
+  every `q.dead`; without the replay the reconnect would succeed and then fail every
+  publish. Best-effort: a `PRECONDITION_FAILED` (an operator changed the arguments while we
+  were away) is logged at `ERROR` and the connection kept, because no connection at all is
+  strictly worse.
+- **Policy.** `ReconnectPolicy` is a trait with one method, `next_delay(Attempt) -> Option<Duration>`,
+  consulted before every attempt including the first: `Some(ZERO)` tries now, `None` gives up.
+  `Attempt` (non-exhaustive) carries the consecutive failure count, the last error as
+  `&dyn Error`, and a `Rebuilding` discriminant of `Connection` vs `Consumer`, because the two
+  fail for different reasons and deserve different answers. Stored as `Arc<dyn ReconnectPolicy>`
+  so the one policy is shared by every publisher and consumer; `Debug` is a supertrait so
+  `RabbitMqOptions` stays printable. `BackoffPolicy` is the built-in implementation.
+- **Consumers.** `consume` returns a stream that outlives the connection it started on:
+  when the subscription ends or errors it resubscribes rather than propagating. Resubscribe
+  failures are paced by the same policy, because the connection can be healthy while
+  `basic_consume` still fails (a deleted queue), which would otherwise spin.
+- **Termination.** The stream ends, and `Worker::run` returns `Error::ConsumerStopped` as
+  before, in exactly three cases: the backend was closed, reconnection is disabled
+  (`reconnect = None`), or a bounded policy is exhausted. With the default unlimited policy
+  a dead broker is a stalled worker plus `WARN` logs, never an `Err`.
+- **Close is final.** `close` marks the handle closing *before* any channel goes down, so
+  consumers see a deliberate shutdown instead of an outage and stop rather than racing to
+  reconnect. Nothing reopens the connection afterwards.
+- **First connection is exempt.** `connect` / `with_options` do not retry: a process that
+  cannot reach its broker at startup should fail, not block its caller in a backoff loop.
+- **In-flight jobs are not preserved.** The broker requeues every unacknowledged delivery
+  on a drop, so a job mid-handler is redelivered on the new connection and the first run's
+  settle fails (counted in `WorkerHandle::settle_failures`). This is the existing
+  at-least-once contract, not a new one.
+- **Tests.** A TCP proxy in front of the broker (`BrokerProxy` in `tests/broker.rs`) cuts
+  the connection on demand, so recovery is tested without the management plugin and without
+  touching connections the test does not own.
 
 ## Deferral (hold queues, priority return)
 

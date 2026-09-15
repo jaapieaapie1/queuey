@@ -1489,3 +1489,326 @@ async fn deferral_past_the_cap_is_refused() {
     cleanup(&control, &queue).await;
     delete_queues(&control, &[hold]).await;
 }
+
+// ---------------------------------------------------------------------------
+// reconnection
+// ---------------------------------------------------------------------------
+
+/// A TCP proxy in front of the broker, so a test can cut the connection the way
+/// a network partition or a broker restart would.
+///
+/// The alternative, closing the connection through the management HTTP API,
+/// needs the management plugin, credentials for it and a way to find our own
+/// connection among everyone else's. A proxy needs none of that, cuts exactly
+/// the connections this test owns, and cuts them at a moment the test chooses.
+/// Reconnects go through the same proxy, so recovery is observable too.
+struct BrokerProxy {
+    addr: std::net::SocketAddr,
+    /// Every live forwarding task holds a receiver; sending drops the sockets.
+    cut: tokio::sync::broadcast::Sender<()>,
+}
+
+impl BrokerProxy {
+    /// Start listening on an ephemeral port, forwarding to `upstream`.
+    async fn start(upstream: String) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the proxy");
+        let addr = listener.local_addr().expect("proxy address");
+        let (cut, _) = tokio::sync::broadcast::channel(16);
+
+        let accepts = cut.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    return;
+                };
+                let upstream = upstream.clone();
+                let mut stop = accepts.subscribe();
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = tokio::net::TcpStream::connect(&upstream).await else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                        // Returning drops both sockets, which is what the client
+                        // sees as a connection that died under it.
+                        _ = stop.recv() => {}
+                    }
+                });
+            }
+        });
+
+        Self { addr, cut }
+    }
+
+    /// Drop every connection currently going through the proxy.
+    ///
+    /// New connections are still accepted afterwards, so this is a blip rather
+    /// than an outage. [`Self::stop_accepting`] is the other half.
+    fn cut(&self) {
+        let _ = self.cut.send(());
+    }
+
+    /// The AMQP URL that reaches the broker through this proxy.
+    fn url(&self, direct: &str) -> String {
+        let (head, _, tail) = split_url(direct);
+        format!("{head}{}{tail}", self.addr)
+    }
+}
+
+/// Split an AMQP URL into everything up to the host, the `host:port`, and the
+/// rest (vhost and query).
+///
+/// Only the host and port are ever replaced; credentials and vhost have to
+/// survive intact or the proxied connection would not authenticate.
+fn split_url(url: &str) -> (&str, &str, &str) {
+    let scheme_end = url.find("://").expect("an amqp:// url") + "://".len();
+    let rest = &url[scheme_end..];
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let tail = &rest[authority_end..];
+
+    match authority.rfind('@') {
+        // Credentials stay in the head, so only `host:port` is swapped.
+        Some(at) => (&url[..scheme_end + at + 1], &authority[at + 1..], tail),
+        None => (&url[..scheme_end], authority, tail),
+    }
+}
+
+/// The `host:port` an AMQP URL points at, with the AMQP default port filled in.
+fn upstream_addr(url: &str) -> String {
+    let (_, hostport, _) = split_url(url);
+    if hostport.contains(':') {
+        hostport.to_owned()
+    } else {
+        format!("{hostport}:5672")
+    }
+}
+
+/// Wait until the backend has noticed that its connection is gone.
+///
+/// Cutting the sockets and immediately asserting would race the client: lapin
+/// marks the connection dead when its IO loop next touches it, not when the
+/// packets stop.
+async fn await_disconnected(backend: &RabbitMqBackend) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if !backend.is_connected() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the backend never noticed its connection was cut");
+}
+
+#[tokio::test]
+async fn publishing_reconnects_after_the_connection_drops() {
+    let Some(url) = std::env::var("AMQP_URL").ok() else {
+        eprintln!("skipping: AMQP_URL not set");
+        return;
+    };
+
+    let proxy = BrokerProxy::start(upstream_addr(&url)).await;
+    let queue = unique_queue("reconnect-publish");
+    let config = QueueConfig::new(queue.clone());
+    let backend = RabbitMqBackend::connect(&proxy.url(&url))
+        .await
+        .expect("connect through the proxy");
+    // Assertions go over a direct connection: the proxy is the thing under test.
+    let control = control(&url).await;
+
+    backend
+        .declare(std::slice::from_ref(&config))
+        .await
+        .expect("declare");
+    backend
+        .publish(&envelope(&queue, 1), None)
+        .await
+        .expect("publish before the cut");
+    await_count(&control, &queue, 1).await;
+
+    proxy.cut();
+    await_disconnected(&backend).await;
+
+    // The publish is what notices the connection is gone: it must wait for a
+    // replacement rather than fail.
+    backend
+        .publish(&envelope(&queue, 2), None)
+        .await
+        .expect("publish after the cut must reconnect, not fail");
+    await_count(&control, &queue, 2).await;
+    assert!(
+        backend.is_connected(),
+        "the backend is back on a connection"
+    );
+
+    cleanup(&control, &queue).await;
+    backend.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn a_consumer_resubscribes_after_the_connection_drops() {
+    let Some(url) = std::env::var("AMQP_URL").ok() else {
+        eprintln!("skipping: AMQP_URL not set");
+        return;
+    };
+
+    let proxy = BrokerProxy::start(upstream_addr(&url)).await;
+    let queue = unique_queue("reconnect-consume");
+    let config = QueueConfig::new(queue.clone());
+    let backend = RabbitMqBackend::connect(&proxy.url(&url))
+        .await
+        .expect("connect through the proxy");
+    let control = control(&url).await;
+
+    backend
+        .declare(std::slice::from_ref(&config))
+        .await
+        .expect("declare");
+    let mut stream = backend.consume(&config).await.expect("consume");
+
+    backend
+        .publish(&envelope(&queue, 1), None)
+        .await
+        .expect("publish");
+    let first = next_delivery(&mut stream, Duration::from_secs(5)).await;
+    assert_eq!(first.envelope().attempt, 1);
+    first.ack().await.expect("ack before the cut");
+
+    proxy.cut();
+    await_disconnected(&backend).await;
+
+    // The same stream, across a connection it did not start on. A job published
+    // after the cut has to come out of it, which it only can if the consumer
+    // resubscribed on the new connection.
+    backend
+        .publish(&envelope(&queue, 2), None)
+        .await
+        .expect("publish after the cut");
+
+    // The first job may well arrive a second time. `basic_ack` is a
+    // fire-and-forget AMQP frame with no broker confirmation, so cutting the
+    // socket can drop the ack before the broker processed it, and the broker
+    // then requeues the delivery. That is the at-least-once contract this
+    // backend documents, not a failure of the resubscribe, so tolerate the
+    // duplicate and keep reading until the job published after the cut shows up.
+    let mut resubscribed = false;
+    for _ in 0..3 {
+        let delivery = next_delivery(&mut stream, Duration::from_secs(15)).await;
+        let attempt = delivery.envelope().attempt;
+        delivery.ack().await.expect("ack after the cut");
+        if attempt == 2 {
+            resubscribed = true;
+            break;
+        }
+        assert_eq!(
+            attempt, 1,
+            "only the job that was in flight across the cut can be redelivered"
+        );
+    }
+    assert!(
+        resubscribed,
+        "the resubscribed consumer never delivered the job published after the cut"
+    );
+
+    drop(stream);
+    cleanup(&control, &queue).await;
+    backend.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn a_reconnect_redeclares_the_queues_it_had_declared() {
+    let Some(url) = std::env::var("AMQP_URL").ok() else {
+        eprintln!("skipping: AMQP_URL not set");
+        return;
+    };
+
+    let proxy = BrokerProxy::start(upstream_addr(&url)).await;
+    let queue = unique_queue("reconnect-redeclare");
+    let config = QueueConfig::new(queue.clone());
+    let backend = RabbitMqBackend::connect(&proxy.url(&url))
+        .await
+        .expect("connect through the proxy");
+    let control = control(&url).await;
+
+    backend
+        .declare(std::slice::from_ref(&config))
+        .await
+        .expect("declare");
+
+    proxy.cut();
+    await_disconnected(&backend).await;
+
+    // Delete the queues while the backend is away. This is what a broker that
+    // restarted looks like from the client's side: the connection came back,
+    // but the topology on it did not. Nothing here can race the backend, since
+    // with no consumer running nothing asks for a connection until we do.
+    delete_queues(&control, &family(&queue)).await;
+    assert!(!queue_exists(&control, &queue).await, "the queue is gone");
+
+    // Publishes are `mandatory`, so this can only succeed if the reconnect put
+    // the queue back first.
+    backend
+        .publish(&envelope(&queue, 1), None)
+        .await
+        .expect("publish after the cut must find a re-declared queue");
+    await_count(&control, &queue, 1).await;
+    assert!(
+        queue_exists(&control, &backend.dead_queue_name(&queue)).await,
+        "the dead-letter queue is re-declared too"
+    );
+
+    cleanup(&control, &queue).await;
+    backend.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn reconnection_can_be_turned_off() {
+    let Some(url) = std::env::var("AMQP_URL").ok() else {
+        eprintln!("skipping: AMQP_URL not set");
+        return;
+    };
+
+    let proxy = BrokerProxy::start(upstream_addr(&url)).await;
+    let queue = unique_queue("reconnect-disabled");
+    let config = QueueConfig::new(queue.clone());
+    let backend =
+        RabbitMqBackend::with_options(&proxy.url(&url), RabbitMqOptions::default().reconnect(None))
+            .await
+            .expect("connect through the proxy");
+    let control = control(&url).await;
+
+    backend
+        .declare(std::slice::from_ref(&config))
+        .await
+        .expect("declare");
+    let mut stream = backend.consume(&config).await.expect("consume");
+
+    proxy.cut();
+    await_disconnected(&backend).await;
+
+    // The pre-reconnection contract: the stream ends rather than recovering,
+    // which is what `Worker::run` turns into `Error::ConsumerStopped`.
+    match tokio::time::timeout(Duration::from_secs(10), stream.next()).await {
+        Ok(None) => {}
+        Ok(Some(Ok(_))) => panic!("a delivery arrived on a connection that was cut"),
+        // lapin may report the drop as a stream error before ending the stream;
+        // either way the stream is over, which is the point.
+        Ok(Some(Err(_))) => {}
+        Err(_) => panic!("the consumer stream neither ended nor errored"),
+    }
+
+    let error = backend
+        .publish(&envelope(&queue, 1), None)
+        .await
+        .expect_err("publishing must fail rather than reconnect");
+    assert!(
+        error.to_string().contains("reconnection is disabled"),
+        "unexpected error: {error}"
+    );
+
+    drop(stream);
+    cleanup(&control, &queue).await;
+    let _ = backend.close().await;
+}

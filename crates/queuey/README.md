@@ -24,7 +24,7 @@ the derive macros from `queuey-macros`, and, behind the default `rabbitmq` featu
 
 ```toml
 [dependencies]
-queuey = "0.2"
+queuey = "0.3"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
@@ -376,8 +376,10 @@ or a re-export under yet another name, `#[queues(crate = "...")]` and
 | [`queuey-rabbitmq`](../rabbitmq/README.md) | `RabbitMqBackend` on `lapin`: topology, deferral hold queues, upgrade notes |
 
 [ARCHITECTURE.md](../../ARCHITECTURE.md) covers the design, the RabbitMQ topology and
-the retry and deferral semantics in full. Reconnection after a dropped connection is
-out of scope for this version: consumer streams end and `Worker::run` returns an error.
+the retry and deferral semantics in full. A dropped connection is recovered
+automatically by the RabbitMQ backend: publishes wait for the reconnect, consumers
+resubscribe, and `Worker::run` keeps going. See
+[`queuey-rabbitmq`](../rabbitmq/README.md#reconnection) for the policy and its limits.
 
 ## Minimum supported Rust version
 

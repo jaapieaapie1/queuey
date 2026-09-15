@@ -21,5 +21,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 serde.workspace = true
+# `net` and `io-util` are only needed by the TCP proxy the reconnection tests
+# put in front of the broker so they can cut the connection.
+tokio = { workspace = true, features = ["net", "io-util"] }
 tracing-subscriber.workspace = true
 uuid.workspace = true

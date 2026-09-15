@@ -114,6 +114,42 @@ pub(crate) enum RabbitMqError {
         /// The AMQP short string limit.
         limit: usize,
     },
+
+    /// The connection is gone and this backend is configured not to rebuild it.
+    ///
+    /// Only reachable with
+    /// [`RabbitMqOptions::reconnect`](crate::RabbitMqOptions::reconnect) set to
+    /// [`None`]; with the default policy the operation waits for a reconnect
+    /// instead of failing here.
+    #[error("the rabbitmq connection is gone and reconnection is disabled")]
+    ConnectionLost,
+
+    /// Reconnection was attempted and gave up.
+    ///
+    /// Only reachable with a bounded
+    /// [`ReconnectPolicy::max_attempts`](crate::ReconnectPolicy::max_attempts);
+    /// the default policy retries indefinitely and so never produces this.
+    /// Consumer streams end when it happens, so
+    /// [`Worker::run`](queuey_core::Worker::run) returns as it did before
+    /// reconnection existed.
+    #[error("could not reconnect to rabbitmq after {attempts} attempts")]
+    ReconnectExhausted {
+        /// Consecutive connection attempts that failed.
+        attempts: u32,
+        /// The last failure, kept because it says *why* the broker was
+        /// unreachable (refused, TLS, auth) and the attempt count does not.
+        /// Boxed: `lapin::Error` is large and this variant is cold.
+        #[source]
+        source: Option<Box<lapin::Error>>,
+    },
+
+    /// The backend has been closed, so it will not open another connection.
+    ///
+    /// Closing is final by design: a [`close`](queuey_core::Backend::close) that
+    /// left the reconnect loop running would keep the process dialling a broker
+    /// nobody intends to use again.
+    #[error("the rabbitmq backend is closed")]
+    Closed,
 }
 
 impl RabbitMqError {

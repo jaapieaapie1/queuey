@@ -10,13 +10,15 @@ Type-safe job queues for Rust on RabbitMQ.
 * Fatal vs retryable errors, dead-letter queues, graceful shutdown, `tracing` instrumentation.
 * **Deferral** for rate limits: a job that cannot run *yet* waits exactly as long as the
   API asks and comes back ahead of the backlog, without spending an attempt.
+* **Automatic reconnection**: a dropped broker connection is a pause, not a failure.
+  Publishes wait, consumers resubscribe, `Worker::run` keeps going; policy is pluggable.
 * Transport-agnostic core with an in-memory backend for tests.
 * One dependency: the derives resolve their own paths through the `queuey`
   facade, so no `crate = "..."` attribute and no direct dependency on the core crate.
 
 ```toml
 [dependencies]
-queuey = "0.2"
+queuey = "0.3"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```

@@ -147,10 +147,56 @@
 //!   moved aside and logged, never surfaced as a stream error, so one poison
 //!   message cannot stall a consumer.
 //!
-//! # Not in scope for v1
+//! # Reconnection
 //!
-//! Reconnection. When the connection drops, consumer streams end and further
-//! calls fail; supervising and rebuilding the backend is the caller's job.
+//! The connection is a slot, not a socket. When it drops, the first operation to
+//! notice dials a replacement while the rest queue behind that one attempt,
+//! every queue this backend declared is re-declared on the new connection, and
+//! the consumer streams resubscribe and keep yielding. A publish issued during
+//! the outage waits rather than failing, and
+//! [`Worker::run`](queuey_core::Worker::run) keeps running across a broker
+//! restart.
+//!
+//! Pacing is [`RabbitMqOptions::reconnect`]'s job, and it takes any
+//! [`ReconnectPolicy`]. The default, [`BackoffPolicy`], is unlimited, so a
+//! broker that never returns is a stalled worker and a stream of `WARN` logs
+//! rather than an error; bound it with [`BackoffPolicy::max_attempts`], swap in
+//! a policy of your own when a backoff curve is not the right shape (a circuit
+//! breaker, a schedule, a different answer for an authentication failure than
+//! for a refused connection), or pass [`None`] for the original fail-fast
+//! behaviour, where consumer streams end and
+//! [`Error::ConsumerStopped`](queuey_core::Error::ConsumerStopped) surfaces.
+//!
+//! ```
+//! use std::time::Duration;
+//!
+//! use queuey_rabbitmq::{Attempt, RabbitMqOptions, Rebuilding, ReconnectPolicy};
+//!
+//! /// Retries the connection forever, but gives up on a consumer whose queue
+//! /// has gone missing: waiting does not bring a deleted queue back.
+//! #[derive(Debug)]
+//! struct ConnectionOnly;
+//!
+//! impl ReconnectPolicy for ConnectionOnly {
+//!     fn next_delay(&self, attempt: Attempt<'_>) -> Option<Duration> {
+//!         match attempt.rebuilding {
+//!             Rebuilding::Consumer if attempt.failures >= 3 => None,
+//!             _ => Some(Duration::from_secs(2)),
+//!         }
+//!     }
+//! }
+//!
+//! let options = RabbitMqOptions::default().reconnect_with(ConnectionOnly);
+//! ```
+//!
+//! Two things do not survive an outage. Jobs that were in flight are requeued by
+//! the broker and delivered again, and their first run's settle fails (counted
+//! in
+//! [`WorkerHandle::settle_failures`](queuey_core::WorkerHandle::settle_failures));
+//! that is the at-least-once contract above, not a new one. And the *first*
+//! connection is not retried at all: [`RabbitMqBackend::connect`] fails if the
+//! broker is unreachable at startup, rather than blocking its caller in a
+//! backoff loop.
 //!
 //! [`queuey`]: queuey_core
 
@@ -158,10 +204,12 @@
 #![warn(missing_docs)]
 
 mod backend;
+mod connection;
 mod delivery;
 mod error;
 mod options;
 mod publisher;
+mod reconnect;
 
 pub mod codec;
 pub mod topology;
@@ -169,6 +217,11 @@ pub mod topology;
 pub use backend::RabbitMqBackend;
 pub use delivery::RabbitMqDelivery;
 pub use options::RabbitMqOptions;
+pub use reconnect::{Attempt, BackoffPolicy, Rebuilding, ReconnectPolicy};
+
+/// Re-export of the backoff curve [`BackoffPolicy`] is built from, so a policy
+/// can be tuned without naming `queuey-core` as a dependency.
+pub use queuey_core::Backoff;
 
 /// Re-export of the `lapin` version this backend is built against, so callers
 /// can name [`lapin::ConnectionProperties`] without pinning it themselves.

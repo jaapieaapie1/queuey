@@ -16,8 +16,69 @@ RabbitMQ backend for [`queuey`](../..), built on [`lapin`](https://crates.io/cra
 * one throwaway channel per `declare`, so a rejected declaration cannot poison
   the other channels.
 
-Reconnection is out of scope for v1: when the connection drops, consumer streams
-end and further calls fail.
+## Reconnection
+
+The connection above is a slot, not a socket. When it drops, the first operation to
+notice dials a replacement, everything else queues behind that one attempt, every queue
+this backend declared is re-declared on the new connection, and the consumer streams
+resubscribe and keep yielding. A publish issued during the outage waits instead of
+failing, and `Worker::run` keeps running across a broker restart.
+
+By default it retries forever with a jittered exponential backoff (500ms base, doubling,
+capped at 30s), so a broker that never comes back shows up as a stalled worker and a
+stream of `WARN` logs rather than an error. Bound it, or turn it off:
+
+```rust
+use queuey_rabbitmq::{BackoffPolicy, RabbitMqOptions};
+
+// Give up after ten tries; consumer streams then end and `Worker::run` returns.
+let bounded = RabbitMqOptions::default()
+    .reconnect_with(BackoffPolicy::default().max_attempts(Some(10)));
+
+// Or fail on the first drop, as this backend did before 0.3.
+let never = RabbitMqOptions::default().reconnect(None);
+```
+
+`BackoffPolicy` is only the built-in answer. `reconnect_with` takes any `ReconnectPolicy`,
+which is one method: given an `Attempt`, return how long to wait or `None` to stop. The
+attempt carries the consecutive failure count, the last error, and whether the backend is
+rebuilding the connection or a consumer's subscription — so a policy can express what a
+curve cannot, such as a circuit breaker, a maintenance window, giving up immediately on
+`ACCESS_REFUSED`, or retrying the connection forever while abandoning a consumer whose
+queue an operator deleted.
+
+```rust
+use std::time::Duration;
+use queuey_rabbitmq::{Attempt, RabbitMqOptions, Rebuilding, ReconnectPolicy};
+
+#[derive(Debug)]
+struct ConnectionOnly;
+
+impl ReconnectPolicy for ConnectionOnly {
+    fn next_delay(&self, attempt: Attempt<'_>) -> Option<Duration> {
+        match attempt.rebuilding {
+            Rebuilding::Consumer if attempt.failures >= 3 => None,
+            _ => Some(Duration::from_secs(2)),
+        }
+    }
+}
+
+let options = RabbitMqOptions::default().reconnect_with(ConnectionOnly);
+```
+
+The policy is consulted before *every* attempt, the first one included, so it also decides
+whether to start at all (`None` straight away means never reconnect) and whether the first
+try waits. `BackoffPolicy` returns zero there, because a failover is often complete by the
+time the client notices.
+
+Jobs in flight when the connection drops do **not** survive it. The broker requeues every
+unacknowledged delivery, so a job whose handler was still running is delivered again on
+the new connection, and the settle its first run eventually attempts fails and is counted
+in `WorkerHandle::settle_failures`. That is the at-least-once contract this backend
+already had; an outage is when it stops being theoretical.
+
+Only the *first* connection is exempt: `connect` / `with_options` fail rather than retry,
+so a process that cannot reach its broker at startup says so instead of hanging.
 
 ## Topology
 

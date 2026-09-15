@@ -1,11 +1,7 @@
 //! The shared publishing channels: one in confirm mode for publishes, one plain
 //! channel for the on-demand hold queue declarations.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex as StdMutex},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use lapin::{
     BasicProperties, Channel, Confirmation, Connection,
@@ -17,6 +13,7 @@ use tracing::{debug, warn};
 
 use crate::{
     codec,
+    connection::ConnectionHandle,
     error::{RabbitMqError, amqp, short_string},
     options::RabbitMqOptions,
     topology,
@@ -53,23 +50,13 @@ use crate::{
 /// lazily when the broker has closed them.
 #[derive(Clone)]
 pub(crate) struct Publisher {
-    connection: Arc<Connection>,
+    connection: Arc<ConnectionHandle>,
     channel: Arc<Mutex<Channel>>,
     /// Channel used only for the on-demand hold queue declarations. Not in
     /// confirm mode: nothing is published on it, and a declaration is
     /// synchronous already.
     declare_channel: Arc<Mutex<Channel>>,
     options: Arc<RabbitMqOptions>,
-    /// Every [`QueueConfig`] this backend has declared, by queue name.
-    ///
-    /// A retry or deferral has to declare a hold queue, and a hold queue must be
-    /// durable exactly when its main queue is: a transient hold queue in front
-    /// of a durable work queue would silently lose held jobs on a broker restart.
-    /// The publisher only ever sees an [`Envelope`], which carries a queue
-    /// *name* and nothing else, so the backend records what it declared here and
-    /// the publisher looks it up. Kept behind a plain `std` mutex: it is a
-    /// handful of clones guarded for microseconds, never across an `await`.
-    configs: Arc<StdMutex<HashMap<String, QueueConfig>>>,
 }
 
 impl std::fmt::Debug for Publisher {
@@ -82,7 +69,7 @@ impl Publisher {
     /// Wrap an already-opened confirm-mode `channel` plus a plain
     /// `declare_channel` for hold queue declarations.
     pub(crate) fn new(
-        connection: Arc<Connection>,
+        connection: Arc<ConnectionHandle>,
         channel: Channel,
         declare_channel: Channel,
         options: Arc<RabbitMqOptions>,
@@ -92,17 +79,7 @@ impl Publisher {
             channel: Arc::new(Mutex::new(channel)),
             declare_channel: Arc::new(Mutex::new(declare_channel)),
             options,
-            configs: Arc::new(StdMutex::new(HashMap::new())),
         }
-    }
-
-    /// Remember what `config` was declared as, for later hold queue declarations.
-    ///
-    /// Called by [`RabbitMqBackend::declare`](crate::RabbitMqBackend) for every
-    /// queue it successfully declares. Re-declaring overwrites.
-    pub(crate) fn remember(&self, config: &QueueConfig) {
-        self.lock_configs()
-            .insert(config.name.clone(), config.clone());
     }
 
     /// The config `queue` was declared with, or [`None`] if this backend never
@@ -118,20 +95,10 @@ impl Publisher {
     /// would vanish an hour later with nothing reported anywhere.
     ///
     /// [`publish_held`](Publisher::publish_held) therefore turns [`None`] into
-    /// [`Error::UnknownQueue`].
+    /// [`Error::UnknownQueue`]. The map itself lives on the
+    /// [`ConnectionHandle`], which also replays it after a reconnect.
     fn config_for(&self, queue: &str) -> Option<QueueConfig> {
-        self.lock_configs().get(queue).cloned()
-    }
-
-    /// Lock the config map, ignoring poisoning.
-    ///
-    /// The map holds plain data with no invariants to break, so a panic in
-    /// another thread while it was locked is no reason to fail every subsequent
-    /// publish.
-    fn lock_configs(&self) -> std::sync::MutexGuard<'_, HashMap<String, QueueConfig>> {
-        self.configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.connection.config_for(queue)
     }
 
     /// Open a fresh channel and put it into confirm mode.
@@ -171,6 +138,12 @@ impl Publisher {
     /// operation the broker routinely refuses cannot close it. An unroutable
     /// `mandatory` publish is not a channel exception either.
     ///
+    /// When the *connection* is what died, the replacement channel is opened on
+    /// a reconnected one, so a publish issued during an outage waits for the
+    /// broker to come back instead of failing. The wait happens under this
+    /// mutex, which is what makes concurrent publishers queue behind one
+    /// reconnect rather than each demanding their own.
+    ///
     /// The caller decides how long to hold the guard: [`publish_confirmed`] lets
     /// go before awaiting the broker's confirmation, so publishers pipeline.
     ///
@@ -183,7 +156,8 @@ impl Publisher {
                 channel = channel.id(),
                 "publishing channel is closed; opening a replacement in confirm mode"
             );
-            *channel = Self::open_confirm_channel(&self.connection).await?;
+            let connection = self.connection.ensure_connected().await?;
+            *channel = Self::open_confirm_channel(&connection).await?;
         }
         Ok(channel)
     }
@@ -205,7 +179,8 @@ impl Publisher {
                 channel = channel.id(),
                 "declaration channel is closed; opening a replacement"
             );
-            *channel = self.connection.create_channel().await.map_err(amqp)?;
+            let connection = self.connection.ensure_connected().await?;
+            *channel = connection.create_channel().await.map_err(amqp)?;
         }
         Ok(channel)
     }
