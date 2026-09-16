@@ -47,16 +47,14 @@ fn hold_queue(queue: &str, delay: Duration) -> String {
 }
 
 fn envelope(queue: &str, attempt: u32) -> Envelope {
-    Envelope {
-        job_id: Uuid::new_v4(),
-        job_type: "queuey_rabbitmq::tests::Probe".to_owned(),
-        queue: queue.to_owned(),
-        attempt,
-        enqueued_at_ms: 1_700_000_000_000,
-        deferrals: 0,
-        priority: 0,
-        payload: serde_json::json!({ "probe": true, "n": attempt }),
-    }
+    let mut envelope = Envelope::raw(
+        "queuey_rabbitmq::tests::Probe",
+        queue,
+        serde_json::json!({ "probe": true, "n": attempt }),
+    );
+    envelope.attempt = attempt;
+    envelope.enqueued_at_ms = 1_700_000_000_000;
+    envelope
 }
 
 /// A second connection, used for assertions and cleanup so that nothing the
@@ -1488,6 +1486,77 @@ async fn deferral_past_the_cap_is_refused() {
     backend.close().await.expect("close");
     cleanup(&control, &queue).await;
     delete_queues(&control, &[hold]).await;
+}
+
+#[tokio::test]
+async fn a_borrowed_channel_works_an_application_queue_on_the_same_connection() {
+    let Some(url) = std::env::var("AMQP_URL").ok() else {
+        eprintln!("skipping: AMQP_URL not set");
+        return;
+    };
+
+    let queue = unique_queue("borrowed-jobs");
+    // Not part of the library's topology: no suffix it knows, nothing declared
+    // through `Backend::declare`. This is the queue an application shares with
+    // some other system.
+    let app = unique_queue("borrowed-app");
+    let config = QueueConfig::new(queue.clone());
+    let backend = RabbitMqBackend::connect(&url).await.expect("connect");
+    let control = control(&url).await;
+    backend
+        .declare(std::slice::from_ref(&config))
+        .await
+        .expect("declare");
+
+    let opened_on = backend.connection_generation();
+    let channel = backend.create_channel().await.expect("create_channel");
+
+    // Declaring on the borrowed channel is the caller's own business: the
+    // backend neither knows about this queue nor deletes it.
+    channel
+        .queue_declare(
+            app.as_str().into(),
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect("declare the application queue");
+
+    let body: &[u8] = b"not an envelope, and nothing here should care";
+    publish_raw(&channel, &app, body).await;
+    assert_eq!(ready_count(&control, &app).await, 1);
+
+    let message = channel
+        .basic_get(app.as_str().into(), BasicGetOptions { no_ack: true })
+        .await
+        .expect("basic_get")
+        .expect("the message published on the borrowed channel")
+        .delivery;
+    assert_eq!(message.data.as_slice(), body, "the body came back verbatim");
+
+    // The backend's own channels are untouched by any of that, in particular by
+    // the `confirm_select` the raw publish put on the borrowed channel.
+    backend
+        .publish(&envelope(&queue, 1), None)
+        .await
+        .expect("the backend still publishes on its own channel");
+    await_count(&control, &queue, 1).await;
+
+    // No reconnect happened, so the borrowed channel is still the one that was
+    // handed out: the generation a caller would compare against has not moved.
+    assert_eq!(
+        backend.connection_generation(),
+        opened_on,
+        "the connection was never replaced during this exchange"
+    );
+    assert!(channel.status().connected(), "the borrowed channel is live");
+
+    // Closing it is the caller's job; the backend would not do it.
+    channel.close(200, "OK".into()).await.expect("close");
+
+    backend.close().await.expect("close");
+    cleanup(&control, &queue).await;
+    delete_queues(&control, &[app]).await;
 }
 
 // ---------------------------------------------------------------------------

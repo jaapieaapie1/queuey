@@ -73,6 +73,28 @@ Failures to ack / retry / dead-letter are logged at `ERROR` and counted in
 `WorkerHandle::settle_failures()`: the job ran, the broker was not told, so the message
 will be redelivered. This signals duplicate work, not lost work.
 
+## Dead-letter hook
+
+`WorkerBuilder::on_dead_letter(hook)` registers a `DeadLetterHook` that the worker calls for every
+job it gives up on. Dead-lettering is the outcome applications usually have to act on (tell the
+system that enqueued the job, alert, mark an endpoint dead) and the one no handler can observe by
+itself: `NoHandler` and `Decode` never reach user code at all, and a handler returning `Retryable`
+cannot know whether the policy will retry or give up without re-deriving the policy.
+
+The hook receives an owned `DeadLetter { envelope, cause, reason, max_attempts }`, where `cause` is
+`NoHandler` | `Decode` | `Fatal` | `Exhausted` (`max_attempts` is `None` for `NoHandler`: no handler,
+so no policy to resolve) and `reason` is the same text passed to `Delivery::dead_letter`.
+
+Ordering is the contract: **the hook is awaited before the delivery is settled.** A process that dies
+in between leaves the delivery unsettled, so the broker redelivers and the hook runs again:
+at-least-once, like everything else here. Settling first would instead lose the notification for a job
+that is already gone, which is the failure this exists to prevent. Consequences, all deliberate:
+
+- a hook that blocks holds one prefetch slot for its queue;
+- a hook that panics is caught (it runs in its own task), logged at `ERROR`, and the job is
+  dead-lettered anyway: the hook is a notification, never a veto;
+- a hook must tolerate being called twice for one job, exactly as handlers must.
+
 ## Macro attribute grammar
 
 `#[derive(Queues)]` on a fieldless enum:
@@ -106,11 +128,56 @@ Generated code is scope-hygienic: primitives are emitted as `::core::primitive::
 user type named `str` cannot break the derive, and each `impl` carries `#[automatically_derived]`
 plus `#[allow(clippy::approx_constant)]` for `factor` literals such as `3.14159265358979`.
 
+## Wire format and stability (1.0)
+
+The envelope is the only thing 1.0 can never change: a queue drained after a deploy
+holds envelopes written by the version before it, so the format outlives the binary.
+
+```
+job_id  job_type  queue  attempt  enqueued_at_ms  deferrals  priority  correlation_id  payload
+```
+
+Rules that hold for the whole of 1.x:
+
+- Fields are only ever **added**, never renamed, retyped or removed, and every added
+  field carries `#[serde(default)]` so a body written by an older producer still
+  decodes. `deferrals`, `priority` and `correlation_id` all arrived that way, and
+  `correlation_id` is additionally `skip_serializing_if = "Option::is_none"`, so an
+  unset one costs nothing on the wire.
+- `correlation_id` is caller-owned and never interpreted: `Producer::enqueue_with`
+  sets it, `Envelope::next_attempt` and `Envelope::deferred` carry it, the worker hands
+  it to the handler as `JobContext::correlation_id`, and the dead-letter hook sees it on
+  `DeadLetter::envelope`. It exists so a job can be tied back to the request that
+  created it across services; the library reads nothing from it.
+- Every public struct with public fields and every public enum is `#[non_exhaustive]`
+  (`Envelope`, `QueueConfig`, `JobContext`, `RetryPolicy`, `Backoff`, `RetryDecision`,
+  `Error`, `JobError`, `AckKind`, `DeadLetter`, `DeadLetterCause`, `Attempt`), so
+  adding a field or a variant stays a minor release. Construction goes through
+  `QueueConfig::new`, `RetryPolicy::new`, `Envelope::new` / `Envelope::raw` and the
+  builders, and downstream `match` arms need a wildcard.
+- `Backend` and `Delivery` are implementable outside the workspace and only ever gain
+  defaulted methods in 1.x. See the stability note in `crates/core/src/backend.rs`.
+
 ## Retry semantics
 
 - `attempt` is 1-based and lives in the envelope. `RetryPolicy::decide(failed_attempt)`.
 - `JobError::Retryable` -> policy; `JobError::Fatal` -> dead-letter immediately.
-- Precedence: `Job::retry_policy()` override > `QueueConfig.retry` > default (no retries).
+- Precedence, highest first: `JobHandler::set_retry_policy(&job)` > `WorkerBuilder::job_retry_override::<J>()`
+  > `WorkerBuilder::retry_override(queue)` > `Job::retry_policy()` override > `QueueConfig.retry` >
+  default (no retries).
+- `JobHandler::set_retry_policy` is the only one that sees the *payload*, so it is the only one that can
+  answer "how lenient should we be with **this** job", such as a webhook endpoint with a bad history
+  earning ten attempts while its neighbour on the same queue gets three. Defaulted to `None`, called once per delivery
+  after decode and before `handle`, so `JobContext::max_attempts` already reflects it, and the policy it
+  returns is what the failure of that attempt is judged by. It is not pinned across attempts: shrinking a
+  policy below a job's current attempt retires that job on its next failure.
+- The first two are *runtime* overrides, resolved once by `WorkerBuilder::build` into a
+  `Job::NAME -> RetryPolicy` map that dispatch reads; `Worker::retry_policy_for(job_type)` exposes the
+  result. They exist because the macro grammar fixes the numbers at compile time, and how many attempts
+  a flaky downstream deserves is an operational decision, not a code one. They are per worker process:
+  a `Producer` never consults a policy, another worker on the same queue keeps its own, and the
+  override affects `JobContext::max_attempts` so `ctx.is_last_attempt()` stays truthful. An override
+  naming a queue or job type this worker has no handler for is inert and logged at `DEBUG`.
 - `Backoff::Exponential`: `min(max, base * factor^(attempt-1))`, saturating; full jitter `U[0, d]` if enabled.
 
 ## RabbitMQ topology (per queue `q`)
@@ -322,7 +389,9 @@ their own `retry_granularity`.)
 - core: unit tests for backoff math, `RetryPolicy::decide`, envelope round-trip; worker tests against
   `MemoryBackend` with `tokio::time::pause` for delays (success, retry-then-success, give-up, fatal,
   no-handler, decode failure, panic, graceful shutdown, buffered deliveries drained at
-  shutdown, backend closed only when opted in, settle failures counted, prefetch honoured).
+  shutdown, backend closed only when opted in, settle failures counted, prefetch honoured,
+  runtime retry overrides and their precedence, dead-letter hook per cause including its
+  before-settle ordering and a panicking hook).
   Tests synchronise on observable state (backend inspection helpers, virtual time), never
   on wall-clock sleeps or scheduling order.
 - macros: `trybuild` pass/fail cases + expansion assertions via the generated impl (`QueueSet::all`,
@@ -331,7 +400,9 @@ their own `retry_granularity`.)
   `BasicProperties`; integration tests behind `AMQP_URL` env var (`#[ignore]`-free but early-return
   with an `eprintln!` skip notice when unset), exercising declare / publish / consume / retry /
   defer / dead-letter.
-- facade: compile-fail test proving cross-queue-set enqueue is rejected; end-to-end example.
+- facade: compile-fail test proving cross-queue-set enqueue is rejected; end-to-end example; an
+  end-to-end pass over the dead-letter hook and retry overrides through the derives only
+  (`tests/e2e_dead_letter.rs`), since those are configured on the builder a downstream user holds.
 
 ## Conventions
 

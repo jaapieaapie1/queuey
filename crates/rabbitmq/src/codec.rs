@@ -144,16 +144,15 @@ mod tests {
     use serde_json::json;
 
     fn envelope() -> Envelope {
-        Envelope {
-            job_id: "67e55044-10b1-426f-9247-bb680e5fe0c8".parse().unwrap(),
-            job_type: "myapp::jobs::SendEmail".to_owned(),
-            queue: "myapp.emails".to_owned(),
-            attempt: 3,
-            enqueued_at_ms: 1_700_000_000_000,
-            deferrals: 0,
-            priority: 0,
-            payload: json!({ "to": "a@b.c" }),
-        }
+        let mut envelope = Envelope::raw(
+            "myapp::jobs::SendEmail",
+            "myapp.emails",
+            json!({ "to": "a@b.c" }),
+        );
+        envelope.job_id = "67e55044-10b1-426f-9247-bb680e5fe0c8".parse().unwrap();
+        envelope.attempt = 3;
+        envelope.enqueued_at_ms = 1_700_000_000_000;
+        envelope
     }
 
     /// The same envelope after two deferrals onto a 10-level priority queue.

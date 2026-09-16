@@ -1,4 +1,18 @@
 //! Transport abstraction: [`Backend`], [`Delivery`] and [`DeliveryStream`].
+//!
+//! # Stability
+//!
+//! [`Backend`] is public and meant to be implemented outside this workspace: a
+//! backend for another broker is a supported thing to write, and `MemoryBackend` plus
+//! `RabbitMqBackend` are simply the two that ship here. That is a commitment, so for
+//! the whole of 1.x this trait only ever gains methods that come with a default
+//! implementation, and the same goes for [`Delivery`]. An out-of-tree backend that
+//! compiles against 1.0 keeps compiling against every later 1.x.
+//!
+//! What a backend must uphold is written on each method, but two rules decide
+//! correctness: publish before ack (a retry or deferral is durably scheduled *before*
+//! the original delivery is settled, so a crash in between duplicates work rather
+//! than losing it), and nothing is ever released early.
 
 use std::{pin::Pin, time::Duration};
 

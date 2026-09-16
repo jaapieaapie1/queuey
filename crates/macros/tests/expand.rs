@@ -220,15 +220,15 @@ fn config_carries_max_priority() {
 fn config_retry_exponential_with_explicit_values() {
     assert_eq!(
         AppQueues::Images.config().retry,
-        RetryPolicy {
-            max_attempts: 3,
-            backoff: Backoff::Exponential {
+        RetryPolicy::new(
+            3,
+            Backoff::Exponential {
                 base: Duration::from_secs(1),
                 factor: 2.0,
                 max: Duration::from_secs(120),
                 jitter: true,
-            },
-        }
+            }
+        )
     );
 }
 
@@ -236,10 +236,7 @@ fn config_retry_exponential_with_explicit_values() {
 fn config_retry_defaults_mirror_backoff_exponential() {
     assert_eq!(
         Plain::DefaultRetry.config().retry,
-        RetryPolicy {
-            max_attempts: 3,
-            backoff: Backoff::exponential(),
-        }
+        RetryPolicy::new(3, Backoff::exponential())
     );
 }
 
@@ -247,15 +244,15 @@ fn config_retry_defaults_mirror_backoff_exponential() {
 fn config_retry_fully_tuned_exponential() {
     assert_eq!(
         Plain::FullyTuned.config().retry,
-        RetryPolicy {
-            max_attempts: 9,
-            backoff: Backoff::Exponential {
+        RetryPolicy::new(
+            9,
+            Backoff::Exponential {
                 base: Duration::from_millis(250),
                 factor: 1.5,
                 max: Duration::from_secs(3600),
                 jitter: false,
-            },
-        }
+            }
+        )
     );
 }
 
@@ -263,17 +260,11 @@ fn config_retry_fully_tuned_exponential() {
 fn config_retry_fixed_and_none() {
     assert_eq!(
         Plain::Slow.config().retry,
-        RetryPolicy {
-            max_attempts: 2,
-            backoff: Backoff::Fixed(Duration::from_millis(500)),
-        }
+        RetryPolicy::new(2, Backoff::Fixed(Duration::from_millis(500)))
     );
     assert_eq!(
         Plain::Custom.config().retry,
-        RetryPolicy {
-            max_attempts: 3,
-            backoff: Backoff::None,
-        }
+        RetryPolicy::new(3, Backoff::None)
     );
 }
 
@@ -316,10 +307,7 @@ fn retry_policy_is_none_without_the_attribute() {
 fn retry_policy_uses_exponential_defaults() {
     assert_eq!(
         RetryingJob::retry_policy(),
-        Some(RetryPolicy {
-            max_attempts: 5,
-            backoff: Backoff::exponential(),
-        })
+        Some(RetryPolicy::new(5, Backoff::exponential()))
     );
 }
 
@@ -327,17 +315,11 @@ fn retry_policy_uses_exponential_defaults() {
 fn retry_policy_supports_fixed_and_none_backoff() {
     assert_eq!(
         FixedRetryJob::retry_policy(),
-        Some(RetryPolicy {
-            max_attempts: 4,
-            backoff: Backoff::Fixed(Duration::from_secs(2)),
-        })
+        Some(RetryPolicy::new(4, Backoff::Fixed(Duration::from_secs(2))))
     );
     assert_eq!(
         NoBackoffJob::retry_policy(),
-        Some(RetryPolicy {
-            max_attempts: 1,
-            backoff: Backoff::None,
-        })
+        Some(RetryPolicy::new(1, Backoff::None))
     );
 }
 
@@ -348,13 +330,13 @@ fn constant_like_factors_round_trip_without_clippy_complaining() {
     };
     assert!((factor - std::f64::consts::PI).abs() < 1e-12, "{factor}");
 
-    let Some(RetryPolicy {
-        backoff: Backoff::Exponential { factor, max, .. },
-        ..
-    }) = ApproxConstantJob::retry_policy()
-    else {
+    let Some(policy) = ApproxConstantJob::retry_policy() else {
+        panic!("expected a retry policy");
+    };
+    let Backoff::Exponential { factor, max, .. } = policy.backoff else {
         panic!("expected an exponential backoff");
     };
+
     assert!((factor - std::f64::consts::E).abs() < 1e-12, "{factor}");
     assert_eq!(max, Duration::from_secs(600));
 }

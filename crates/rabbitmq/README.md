@@ -80,6 +80,49 @@ already had; an outage is when it stops being theoretical.
 Only the *first* connection is exempt: `connect` / `with_options` fail rather than retry,
 so a process that cannot reach its broker at startup says so instead of hanging.
 
+## Sharing the connection
+
+`RabbitMqBackend::create_channel` opens a fresh `lapin::Channel` on the connection the
+backend is already maintaining, waiting for a reconnect first if that connection happens
+to be down.
+
+It reaches one vhost: the backend's, the one in the URI it was dialled with. Keeping
+application messaging on a *separate* vhost from your jobs is a good default and what this
+library assumes, because it walls job traffic, the dead-letter and hold queues below, and
+the permissions they need off from everything else. An application that does that needs
+its own connection for its own queues, which no method here can give it. This is for the
+other arrangement, where job queues and application queues deliberately share one vhost:
+consuming an ingress queue somebody else publishes to, publishing to a feedback queue
+somebody else reads. There a second connection to the same vhost buys nothing but another
+socket, another set of credentials, another reconnect loop and another thing to close.
+
+```rust
+use queuey_rabbitmq::RabbitMqBackend;
+
+let backend = RabbitMqBackend::connect("amqp://guest:guest@localhost:5672/%2f").await?;
+
+let opened_on = backend.connection_generation();
+let channel = backend.create_channel().await?;
+// ... declare, publish and consume your own queues on `channel` ...
+```
+
+Two things come with it:
+
+* **The channel is yours, and it does not survive a reconnect.** The backend does not
+  track, reopen or close it. When the connection drops, the backend rebuilds *its*
+  channels, consumers and queue declarations on the replacement, but this channel is not
+  among them. It dies with the socket, and nothing tells its holder so.
+  `connection_generation()` is the signal: it starts at `1` and goes up by one per
+  successful reconnect, so a caller records it when it opens a channel and compares it
+  later. A different number means open a new channel and redo the declarations and
+  subscriptions that were on the old one.
+* **Do not collide with the topology below.** Declaring `q`, `q.dead` or
+  `q.deferred.{ttl_ms}` with arguments that differ from the ones the backend uses is
+  answered with `PRECONDITION_FAILED`, which closes the channel it ran on and, for a hold
+  queue, keeps failing every retry and deferral until somebody deletes the queue. Declare
+  only queues that are yours; `dead_queue_name` and `deferred_queue_name` say what the
+  backend's are called.
+
 ## Topology
 
 For each logical queue `q`:
@@ -89,6 +132,20 @@ For each logical queue `q`:
 | `q` | main work queue | `x-message-ttl` when `QueueConfig::message_ttl` is set, `x-max-priority` when `QueueConfig::max_priority` is `Some` |
 | `q.dead` | dead-letter queue | none |
 | `q.deferred.{ttl_ms}` | hold queue, one per distinct delay | `x-message-ttl = ttl_ms`, `x-dead-letter-exchange = ""`, `x-dead-letter-routing-key = q`, `x-expires = 2 * ttl_ms` |
+
+### Classic queues only
+
+Every queue this backend declares is a classic queue, and that is a deliberate 1.0
+limit rather than an oversight. Deferral's whole point is that a rate-limited job
+comes back *ahead* of the backlog, which it does by riding `x-max-priority`; quorum
+queues do not support priorities, so a deferral on one would return behind everything
+published while it waited, silently turning a `Retry-After` into ordinary FIFO work.
+Hold queues also lean on `x-expires` to clean themselves up.
+
+A queue set that never defers and never uses priorities (`#[queue(max_priority = 0)]`
+throughout) has no semantic conflict with quorum queues, but the backend still does
+not declare them: `x-queue-type` is part of a declaration, and changing it on an
+existing queue is a `PRECONDITION_FAILED`, so it would be a migration, not a flag.
 
 Every wait goes through a hold queue: a retry backoff, an `enqueue_after` delay
 and a deferral alike. There is no shared wait queue and no per-message

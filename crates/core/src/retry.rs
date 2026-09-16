@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// How long to wait between attempts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum Backoff {
     /// Retry immediately.
     None,
@@ -45,6 +46,7 @@ impl Backoff {
 
 /// Retry configuration attached to a queue or a job.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RetryPolicy {
     /// Total attempts including the first. `1` means no retries.
     pub max_attempts: u32,
@@ -64,6 +66,7 @@ impl Default for RetryPolicy {
 
 /// Outcome of consulting a policy after a failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RetryDecision {
     /// Re-publish after `delay`.
     Retry {

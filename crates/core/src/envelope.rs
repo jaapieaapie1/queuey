@@ -6,7 +6,15 @@ use uuid::Uuid;
 use crate::{error::Result, job::Job, queue::QueueSet};
 
 /// Wire format for a job message. Serialized as JSON in the message body.
+///
+/// This is the one type in the library that cannot be changed compatibly once
+/// messages exist: a queue drained after a deploy contains envelopes written by the
+/// version before it. Fields are therefore only ever *added*, always with
+/// `#[serde(default)]` so older bodies keep decoding, and the struct is
+/// `#[non_exhaustive]` so adding one is not a breaking change for code that
+/// constructs it. Use [`Envelope::new`] or [`Envelope::raw`] to build one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Envelope {
     /// Unique id, stable across retries.
     pub job_id: Uuid,
@@ -34,6 +42,16 @@ pub struct Envelope {
     /// written before this field existed still decode.
     #[serde(default)]
     pub priority: u8,
+    /// Caller-supplied id tying this job to the work that enqueued it, for tracing
+    /// across services. Untouched by the library: it is carried through retries and
+    /// deferrals, handed to handlers as [`crate::JobContext::correlation_id`], and
+    /// never interpreted. Set it with
+    /// [`EnqueueOptions::correlation_id`](crate::EnqueueOptions::correlation_id).
+    ///
+    /// Defaults to `None` so envelopes written before this field existed still
+    /// decode, and is left out of the JSON entirely when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
     /// The serialized job.
     pub payload: serde_json::Value,
 }
@@ -49,8 +67,39 @@ impl Envelope {
             enqueued_at_ms: now_ms(),
             deferrals: 0,
             priority: 0,
+            correlation_id: None,
             payload: serde_json::to_value(job)?,
         })
+    }
+
+    /// Build a first-attempt envelope from parts, without a [`Job`] type.
+    ///
+    /// For backends and tests that need an envelope for a job type they cannot name.
+    /// Application code wants [`Envelope::new`], which fills `job_type` and `queue`
+    /// from the job itself and cannot get them wrong.
+    pub fn raw(
+        job_type: impl Into<String>,
+        queue: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            job_id: Uuid::new_v4(),
+            job_type: job_type.into(),
+            queue: queue.into(),
+            attempt: 1,
+            enqueued_at_ms: now_ms(),
+            deferrals: 0,
+            priority: 0,
+            correlation_id: None,
+            payload,
+        }
+    }
+
+    /// Set the correlation id, builder-style.
+    #[must_use]
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<String>) -> Self {
+        self.correlation_id = Some(correlation_id.into());
+        self
     }
 
     /// Deserialize the payload as `J`. Does not check `job_type`.
@@ -125,6 +174,58 @@ mod tests {
         assert_eq!(env.deferrals, 0);
         assert_eq!(env.priority, 0);
         assert_eq!(env.payload, serde_json::json!({ "name": "ada" }));
+    }
+
+    #[test]
+    fn a_correlation_id_survives_retries_and_deferrals() {
+        let env = Envelope::new(&Greet::new("ada"))
+            .unwrap()
+            .with_correlation_id("trace-abc");
+
+        assert_eq!(env.correlation_id.as_deref(), Some("trace-abc"));
+        assert_eq!(
+            env.next_attempt().correlation_id.as_deref(),
+            Some("trace-abc")
+        );
+        assert_eq!(
+            env.deferred(10).correlation_id.as_deref(),
+            Some("trace-abc")
+        );
+    }
+
+    #[test]
+    fn an_unset_correlation_id_stays_out_of_the_json() {
+        let env = Envelope::new(&Greet::new("ada")).unwrap();
+        let json = String::from_utf8(env.to_bytes().unwrap()).unwrap();
+        assert!(!json.contains("correlation_id"), "{json}");
+    }
+
+    #[test]
+    fn envelopes_written_before_correlation_ids_still_decode() {
+        // Exactly the body a 0.3 producer wrote.
+        let body = br#"{
+            "job_id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
+            "job_type": "myapp::jobs::SendEmail",
+            "queue": "myapp.emails",
+            "attempt": 2,
+            "enqueued_at_ms": 1700000000000,
+            "deferrals": 1,
+            "priority": 10,
+            "payload": { "to": "a@b.c" }
+        }"#;
+        let env = Envelope::from_bytes(body).unwrap();
+        assert_eq!(env.correlation_id, None);
+        assert_eq!(env.attempt, 2);
+        assert_eq!(env.deferrals, 1);
+    }
+
+    #[test]
+    fn raw_builds_an_envelope_without_a_job_type_in_scope() {
+        let env = Envelope::raw("other::Job", "other.queue", serde_json::json!({ "n": 1 }));
+        assert_eq!(env.job_type, "other::Job");
+        assert_eq!(env.queue, "other.queue");
+        assert_eq!(env.attempt, 1);
+        assert_eq!(env.correlation_id, None);
     }
 
     #[test]

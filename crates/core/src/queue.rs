@@ -6,6 +6,7 @@ use crate::retry::RetryPolicy;
 
 /// Static configuration of a single queue.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct QueueConfig {
     /// Fully-qualified broker queue name (prefix already applied).
     pub name: String,

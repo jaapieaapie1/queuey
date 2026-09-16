@@ -6,19 +6,22 @@ Type-safe job queues for Rust on RabbitMQ.
 * A job statically knows its queue, so `producer.enqueue(&job)` and `worker.handler(h)`
   are checked at compile time. Cross-application mix-ups do not compile.
 * Optional retries with **exponential backoff** (base, factor, cap, full jitter), fixed delay, or none,
-  configurable per queue and overridable per job.
+  configurable per queue, overridable per job, and replaceable at runtime per worker, so the numbers
+  can come from configuration instead of a release.
+* A **dead-letter hook**: one callback for every job a worker gives up on, including the ones no
+  handler ever saw (no handler registered, undecodable payload).
 * Fatal vs retryable errors, dead-letter queues, graceful shutdown, `tracing` instrumentation.
 * **Deferral** for rate limits: a job that cannot run *yet* waits exactly as long as the
   API asks and comes back ahead of the backlog, without spending an attempt.
 * **Automatic reconnection**: a dropped broker connection is a pause, not a failure.
   Publishes wait, consumers resubscribe, `Worker::run` keeps going; policy is pluggable.
-* Transport-agnostic core with an in-memory backend for tests.
+* Transport-agnostic core with an in-memory backend for tests that separates attempts from successes.
 * One dependency: the derives resolve their own paths through the `queuey`
   facade, so no `crate = "..."` attribute and no direct dependency on the core crate.
 
 ```toml
 [dependencies]
-queuey = "0.3"
+queuey = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
@@ -217,6 +220,52 @@ channel with `PRECONDITION_FAILED`. Either:
 
 Queues created from now on get `x-max-priority = 10` by default.
 
+## Runtime knobs on the worker
+
+Two things the macros cannot decide for you, because they are operational rather than structural:
+
+```rust,ignore
+let worker = Worker::<AppQueues, _>::builder(backend)
+    .handler(EmailHandler)
+    // Replace the compiled-in policy for this process: whole queue, or one job type.
+    .retry_override(AppQueues::Emails, RetryPolicy::exponential(attempts_from_config))
+    .job_retry_override::<SendReceipt>(RetryPolicy::none())
+    // Learn about every job this worker gives up on, whatever the cause.
+    .on_dead_letter(FnDeadLetterHook::new(|dead: DeadLetter| async move {
+        tracing::error!(cause = ?dead.cause, attempts = dead.attempts(), "{}", dead.reason);
+    }))
+    .build()
+    .await?;
+```
+
+One job at a time, rather than one kind of job, is the defaulted `set_retry_policy` on the handler
+trait, the only hook that sees the decoded payload and so the only one that can give this webhook
+endpoint ten attempts and its neighbour on the same queue three:
+
+```rust,ignore
+fn set_retry_policy(&self, job: &Deliver) -> Option<RetryPolicy> {
+    self.endpoints.get(&job.endpoint).map(|e| e.policy.clone())
+}
+```
+
+Retry precedence, highest first: `JobHandler::set_retry_policy` > `job_retry_override` >
+`retry_override` > `#[job(retry(...))]` > `#[queue(retry(...))]`. It runs after decode and before
+`handle`, so `ctx.max_attempts` already reflects it. Overrides belong to one worker; a `Producer` never consults a policy.
+
+The hook's `cause` is `NoHandler`, `Decode`, `Fatal` or `Exhausted`, and it is awaited *before* the
+delivery is settled, so a notification is never lost for a job that is already gone. It is
+at-least-once, like the rest of the system. It never changes the outcome: the job is dead-lettered
+either way, and a panicking hook is logged and stepped over.
+
+## Sharing the broker connection
+
+`RabbitMqBackend::create_channel()` hands out a `lapin::Channel` on the backend's own connection, for
+an application whose own queues live on the same vhost as its jobs, where a second connection buys
+only another socket and another reconnect loop. Keep application messaging on its own vhost and it
+needs its own connection instead; a channel cannot cross vhosts. The channel is yours: it does not
+survive a reconnect (compare `connection_generation()` to notice), and it must not redeclare the
+library's own `q`, `q.dead` or `q.deferred.*`.
+
 ## Workspace
 
 | crate | role |
@@ -238,6 +287,28 @@ AMQP_URL=amqp://guest:guest@localhost:5672/%2f cargo test --workspace   # + Rabb
 cargo run -p queuey --example memory_quickstart    # runnable tour, no broker
 cargo run -p queuey --example rabbitmq_end_to_end  # the same against a broker
 ```
+
+## Stability
+
+1.0 means the public surface is committed to, and semantic versioning applies from here.
+
+- **The envelope is frozen.** A queue drained after a deploy holds messages written by
+  the version before it, so fields are only ever added, never renamed, retyped or
+  removed, and every addition carries `#[serde(default)]`. Bodies written by 0.2 and
+  0.3 producers still decode.
+- **Public types are `#[non_exhaustive]`**, so a new field or variant is a minor
+  release. Build them with `QueueConfig::new`, `RetryPolicy::new`, `Envelope::new` and
+  the builders; `match` on the enums with a wildcard arm.
+- **`Backend` and `Delivery` are implementable out of tree.** For the whole of 1.x they
+  only gain methods that have a default implementation, so a backend written against
+  1.0 keeps compiling.
+- **MSRV is 1.88, edition 2024.** A raise is a minor version bump, never a patch.
+- The four crates share one version and are released together.
+
+Known limits, unchanged by 1.0: delivery is at-least-once (a job in flight when the
+connection drops is redelivered, and `WorkerHandle::settle_failures` counts outcomes the
+worker could not report); queues are classic, because deferral's overtake rides
+`x-max-priority`, which quorum queues do not support.
 
 ## License
 

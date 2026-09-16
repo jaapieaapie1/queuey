@@ -1509,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "queuey"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "queuey-core",
@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "queuey-core"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1541,7 +1541,7 @@ dependencies = [
 
 [[package]]
 name = "queuey-macros"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "queuey-rabbitmq"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "futures",

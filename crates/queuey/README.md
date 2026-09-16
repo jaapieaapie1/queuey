@@ -24,7 +24,7 @@ the derive macros from `queuey-macros`, and, behind the default `rabbitmq` featu
 
 ```toml
 [dependencies]
-queuey = "0.3"
+queuey = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
@@ -90,8 +90,10 @@ async fn main() -> queuey::Result<()> {
 `use queuey::prelude::*` brings in the two derives, the traits they implement
 (`QueueSet`, `Job`), the runtime (`Producer`, `Worker`, `WorkerBuilder`,
 `WorkerHandle`, `JobHandler`, `FnHandler`, `JobContext`, `JobError`), the
-configuration types (`QueueConfig`, `RetryPolicy`, `Backoff`, `DEFAULT_MAX_PRIORITY`),
-`MemoryBackend`, and the three foreign items user code cannot avoid naming:
+configuration types (`QueueConfig`, `RetryPolicy`, `Backoff`, `EnqueueOptions`,
+`DEFAULT_MAX_PRIORITY`), the dead-letter hook (`DeadLetterHook`, `FnDeadLetterHook`,
+`DeadLetter`, `DeadLetterCause`), `MemoryBackend`, `AckKind`, and the three foreign
+items user code cannot avoid naming:
 `async_trait`, `Serialize`/`Deserialize` and `Arc`. With the `rabbitmq` feature it also
 brings in `RabbitMqBackend`.
 
@@ -253,7 +255,27 @@ cheaply clonable publisher pinned to that set.
 | `enqueue(&job)` | publish now, returns the job id |
 | `enqueue_after(&job, delay)` | publish after `delay`, at normal priority; one hold per distinct delay, so delays never block each other |
 | `defer(&job, delay)` | hold for `delay`, then release at the queue's top priority; same holds, different return priority |
+| `enqueue_with(&job, options)` | publish with [`EnqueueOptions`]: the form the other three are shorthands for, and the only one that sets a correlation id |
 | `new_undeclared(backend)` | skip the declaration; the queues must already exist, and such a producer cannot `enqueue_after` or `defer` on RabbitMQ |
+
+### Correlation ids
+
+`EnqueueOptions` carries an optional caller-owned id, so a job can be tied back to the
+request that created it:
+
+```rust,ignore
+producer
+    .enqueue_with(
+        &SendEmail { to: "a@b.c".into(), body: "hi".into() },
+        EnqueueOptions::now().correlation_id(request_id),
+    )
+    .await?;
+```
+
+The id rides in the envelope, survives every retry and deferral, reaches the handler as
+`ctx.correlation_id`, and is on `DeadLetter::envelope` when the job is given up on. The
+library never reads it. `EnqueueOptions::after(delay)` and `EnqueueOptions::deferred(delay)`
+are the scheduled variants, matching `enqueue_after` and `defer`.
 
 ## Worker
 
@@ -266,6 +288,9 @@ cheaply clonable publisher pinned to that set.
 | `queues(&[AppQueues::Emails])` | every queue in the set | consume only these queues |
 | `concurrency(n)` | sum of the consumed queues' prefetch | cap on jobs running at once |
 | `job_timeout(d)` | none | abort a handler running longer than `d` and treat it as a retryable failure |
+| `retry_override(AppQueues::Emails, p)` | what the macros declared | replace the retry policy of every job on that queue, for this process |
+| `job_retry_override::<SendEmail>(p)` | what the macros declared | the same for one job type; beats the per-queue override |
+| `on_dead_letter(hook)` | none | call `hook` for every job this worker gives up on |
 | `close_backend_on_shutdown(true)` | `false` | close the shared backend once `run()` returns |
 
 `worker.run()` consumes until `handle.shutdown()` is called, where `handle` comes from
@@ -284,6 +309,97 @@ redelivered, so a growing count means duplicate work and usually a sick connecti
 A job with no registered handler or an undecodable payload is dead-lettered rather
 than left to poison the queue. A handler that panics or exceeds `job_timeout` counts
 as a retryable failure, so the retry policy decides what happens next.
+
+## Retry policy at runtime
+
+The macro grammar fixes a policy at compile time. That is right for the *shape* of a queue's work
+and wrong for the numbers: how many attempts a flaky downstream deserves, and how long to back off,
+is an operational decision that usually lives in configuration. Two builder methods replace the
+compiled-in policy for one worker process:
+
+```rust,ignore
+let attempts = std::env::var("EMAIL_MAX_ATTEMPTS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+
+let worker = Worker::<AppQueues, _>::builder(backend)
+    .retry_override(AppQueues::Emails, RetryPolicy::exponential(attempts))  // whole queue
+    .job_retry_override::<SendReceipt>(RetryPolicy::none())                 // one job type
+    .handler(EmailHandler)
+    .build()
+    .await?;
+
+assert_eq!(worker.retry_policy_for(SendEmail::NAME).unwrap().max_attempts, attempts);
+```
+
+### Per-job leniency
+
+The three above configure a *kind* of job. `JobHandler::set_retry_policy` configures **one** job,
+because it is the only hook that sees the decoded payload. Two deliveries of the same job type on the
+same queue can then be treated differently. The endpoint that has been flaky since it was onboarded
+earns ten attempts over an hour, the one added this morning gets three:
+
+```rust,ignore
+#[async_trait]
+impl JobHandler for Webhooks {
+    type Job = Deliver;
+
+    fn set_retry_policy(&self, job: &Deliver) -> Option<RetryPolicy> {
+        // `&self` is the handler you built, so this can come from configuration,
+        // a cache, a tier on the subscription, whatever you already have.
+        self.endpoints.get(&job.endpoint).map(|e| e.policy.clone())
+    }
+
+    async fn handle(&self, job: Deliver, ctx: JobContext) -> Result<(), JobError> { /* ... */ }
+}
+```
+
+It is defaulted to `None`, so existing handlers are unaffected. It is called once per delivery, after
+the payload decodes and before `handle`, which means `ctx.max_attempts` and `ctx.is_last_attempt()`
+already speak about the policy this attempt will be judged by. It is synchronous, so keep it cheap and
+do not do I/O in it. Nothing pins it across attempts: return a policy with fewer attempts than the
+job has already made and that job retires on its next failure, which is a fine way to stop a retry
+storm and a surprising way to lose work.
+
+Precedence, highest first: `JobHandler::set_retry_policy` > `job_retry_override` > `retry_override` >
+`#[job(retry(...))]` > `#[queue(retry(...))]`. Overrides are resolved once by `build()` and apply to that worker only: a
+`Producer` never consults a policy, and another worker on the same queue keeps its own. The
+effective policy is what `JobContext::max_attempts` and `ctx.is_last_attempt()` report, so handlers
+stay truthful. An override for a queue or job type this worker has no handler for is inert (and
+logged at `DEBUG`).
+
+## Dead letters
+
+A job the worker gives up on is the outcome an application usually has to act on, and the one no
+handler can see for itself: a job with no registered handler or an undecodable payload never reaches
+user code, and a handler returning `Retryable` cannot tell whether the policy will retry or give up.
+`on_dead_letter` is that notification, in one place instead of a check in every handler:
+
+```rust,ignore
+let worker = Worker::<AppQueues, _>::builder(backend)
+    .handler(EmailHandler)
+    .on_dead_letter(FnDeadLetterHook::new(move |dead: DeadLetter| {
+        let store = store.clone();
+        async move {
+            tracing::error!(
+                job_id = %dead.envelope.job_id,
+                cause = ?dead.cause,          // NoHandler | Decode | Fatal | Exhausted
+                attempts = dead.attempts(),   // of dead.max_attempts, when there was a policy
+                "{}", dead.reason
+            );
+            store.mark_dead(dead.envelope.job_id).await;
+        }
+    }))
+    .build()
+    .await?;
+```
+
+Implement `DeadLetterHook` on a struct for anything with state of its own; `FnDeadLetterHook` is the
+closure adapter, the same shape as `FnHandler`.
+
+The hook runs **before** the delivery is settled, deliberately: if the process dies in between, the
+broker redelivers the job and the hook runs again, whereas settling first would lose the
+notification for a job that is already gone. So the hook is at-least-once like everything else here,
+a hook that blocks holds one prefetch slot, and a hook that panics is logged and the job is
+dead-lettered anyway: it is a notification, never a veto.
 
 ## Compile-time guarantees
 
@@ -334,8 +450,11 @@ async fn flaky_email_is_retried_then_delivered() -> queuey::Result<()> {
 | helper | returns |
 |---|---|
 | `pending(queue)` | messages waiting to be consumed |
-| `acked(queue)` | every envelope acked, in order; a retry acks the envelope it replaces, so this counts attempts |
-| `deferred(queue)` | envelopes still in hold |
+| `acked(queue)` | every envelope acked, in order; a retry or deferral acks the envelope it replaces, so this counts *attempts*, not successes |
+| `succeeded(queue)` | only the attempts whose handler returned `Ok(())`, usually what a test means |
+| `retried(queue)` | attempts acked because a retry was scheduled |
+| `settled(queue)` | the full record as `(Envelope, AckKind)`, in settle order |
+| `deferred(queue)` | envelopes still in hold (a live count, not a history) |
 | `dead_letters(queue)` | dead-lettered envelopes with their reason |
 | `queue_names()`, `queue_config(queue)` | what was declared |
 

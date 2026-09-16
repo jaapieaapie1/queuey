@@ -7,6 +7,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Infrastructure-level errors (serialization, transport, configuration).
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// A job payload or envelope could not be (de)serialized.
     #[error("serialization error: {0}")]
@@ -46,6 +47,7 @@ impl Error {
 
 /// Error returned by a [`crate::JobHandler`].
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum JobError {
     /// Transient failure; the retry policy decides whether to retry.
     #[error("job failed (retryable): {0}")]

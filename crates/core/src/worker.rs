@@ -6,6 +6,10 @@
 //!   duplicate `Job::NAME` -> `Error::DuplicateHandler` at `build()`.
 //! * `builder.queues(&[Q::A, Q::B])` restricts consumption to a subset (default: all).
 //! * `builder.concurrency(n)` caps in-flight jobs per worker process (default: sum of prefetch).
+//! * `builder.retry_override(Q::A, policy)` / `builder.job_retry_override::<J>(policy)` replace
+//!   the policy the macros compiled in, for this process only (see `RetryOverrides`).
+//! * `builder.on_dead_letter(hook)` registers a `DeadLetterHook` called for every job the
+//!   worker gives up on, whatever the cause.
 //! * `builder.close_backend_on_shutdown(bool)` (default `false`) closes the shared backend
 //!   when `run()` returns.
 //! * `builder.build().await?` declares queues and returns a `Worker`.
@@ -15,6 +19,11 @@
 //!   `close_backend_on_shutdown(true)` was set.
 //! * `worker.handle()` -> `WorkerHandle` (Clone) for shutdown from elsewhere, and for
 //!   `WorkerHandle::settle_failures()`.
+//!
+//! Every dead-letter path below first awaits the `DeadLetterHook`, if one is registered,
+//! and only then settles the delivery: a hook that ran while the process died is repeated
+//! after the redelivery, which is the at-least-once behaviour the rest of the system has,
+//! whereas settling first would lose the notification outright.
 //!
 //! Per-delivery algorithm:
 //! 1. Look up handler by `envelope.job_type`; if none -> `dead_letter("no handler")`.
@@ -26,7 +35,8 @@
 //!    `defer(env.deferred(priority), delay)` where `priority` is the job queue's
 //!    `max_priority.unwrap_or(0)`. Nothing failed: `attempt` is unchanged, the retry
 //!    policy is never consulted, only `deferrals` grows.
-//! 7. `JobError::Retryable` -> policy = job override or queue default;
+//! 7. `JobError::Retryable` -> policy = builder override, else job override, else queue
+//!    default;
 //!    `policy.decide(attempt)`; `Retry{delay}` -> `retry(env.next_attempt(), delay)`,
 //!    `GiveUp` -> `dead_letter("max attempts")`. `next_attempt` puts `priority` back to
 //!    `0`, so a job that deferred earlier does not keep jumping the backlog on retries.
@@ -54,6 +64,7 @@ use tracing::{Instrument, debug, error, info, warn};
 
 use crate::{
     backend::{Backend, Delivery, DeliveryStream},
+    dead_letter::{DeadLetter, DeadLetterCause, DeadLetterHook},
     envelope::{Envelope, now_ms},
     error::{Error, JobError, Result},
     handler::{JobContext, JobHandler},
@@ -85,15 +96,31 @@ enum JobOutcome {
 /// Type-erased [`JobHandler`], so handlers for different job types can live in one map.
 #[async_trait]
 trait ErasedHandler: Send + Sync + 'static {
-    /// Effective policy: the job override if there is one, else the queue default.
-    fn policy(&self) -> RetryPolicy;
+    /// Policy as declared in the macros: the job override if there is one, else the
+    /// queue default. `build()` resolves this against the builder's overrides once,
+    /// and dispatch uses the resolved value.
+    fn declared_policy(&self) -> RetryPolicy;
+
+    /// Broker name of the queue this job belongs to, so a per-queue override can be
+    /// matched to it at `build()` time.
+    fn queue(&self) -> &'static str;
 
     /// Priority a deferred envelope of this job is republished with: the highest level
     /// its queue supports, or `0` when the queue is not a priority queue.
     fn defer_priority(&self) -> u8;
 
     /// Decode and run the job, never panicking and never returning an error type.
-    async fn run(&self, envelope: &Envelope, timeout: Option<Duration>) -> JobOutcome;
+    ///
+    /// `configured` is what `build()` resolved for this job type. The handler may
+    /// replace it per job via `JobHandler::set_retry_policy`, so the policy that was
+    /// actually used comes back with the outcome: it is what `JobContext` reported and
+    /// what the retry decision has to be made with.
+    async fn run(
+        &self,
+        envelope: &Envelope,
+        timeout: Option<Duration>,
+        configured: &RetryPolicy,
+    ) -> (JobOutcome, RetryPolicy);
 }
 
 /// Adapter from a concrete [`JobHandler`] to [`ErasedHandler`].
@@ -103,29 +130,49 @@ struct ErasedJobHandler<H: JobHandler> {
 
 #[async_trait]
 impl<H: JobHandler> ErasedHandler for ErasedJobHandler<H> {
-    fn policy(&self) -> RetryPolicy {
+    fn declared_policy(&self) -> RetryPolicy {
         <H::Job as Job>::retry_policy().unwrap_or_else(|| <H::Job as Job>::QUEUE.config().retry)
+    }
+
+    fn queue(&self) -> &'static str {
+        <H::Job as Job>::QUEUE.name()
     }
 
     fn defer_priority(&self) -> u8 {
         <H::Job as Job>::QUEUE.config().max_priority.unwrap_or(0)
     }
 
-    async fn run(&self, envelope: &Envelope, timeout: Option<Duration>) -> JobOutcome {
+    async fn run(
+        &self,
+        envelope: &Envelope,
+        timeout: Option<Duration>,
+        configured: &RetryPolicy,
+    ) -> (JobOutcome, RetryPolicy) {
         let job = match envelope.decode::<H::Job>() {
+            // Nothing decoded, so the handler never got to choose: the configured
+            // policy is the only one there is (and a decode failure ignores it anyway).
+            Err(e) => return (JobOutcome::Decode(e.to_string()), configured.clone()),
             Ok(job) => job,
-            Err(e) => return JobOutcome::Decode(e.to_string()),
         };
+
+        // Per-job policy, chosen by the handler from the decoded payload. Resolved
+        // before the context is built so `max_attempts` and `is_last_attempt()` are
+        // already speaking about the policy this attempt will be judged by.
+        let policy = self
+            .handler
+            .set_retry_policy(&job)
+            .unwrap_or_else(|| configured.clone());
 
         let ctx = JobContext {
             job_id: envelope.job_id,
             job_type: <H::Job as Job>::NAME,
             queue: <H::Job as Job>::QUEUE.name(),
             attempt: envelope.attempt,
-            max_attempts: self.policy().max_attempts,
+            max_attempts: policy.max_attempts,
             deferrals: envelope.deferrals,
             priority: envelope.priority,
             age: Duration::from_millis(now_ms().saturating_sub(envelope.enqueued_at_ms)),
+            correlation_id: envelope.correlation_id.clone(),
         };
 
         // Spawning turns a handler panic into a `JoinError` instead of unwinding the
@@ -133,33 +180,44 @@ impl<H: JobHandler> ErasedHandler for ErasedJobHandler<H> {
         let handler = self.handler.clone();
         let mut task = tokio::spawn(async move { handler.handle(job, ctx).await });
 
-        let joined = match timeout {
-            Some(limit) => match tokio::time::timeout(limit, &mut task).await {
-                Ok(joined) => joined,
-                Err(_) => {
-                    task.abort();
-                    // Wait for the cancellation to land: the concurrency permit is
-                    // released when this function returns, so the job must be gone by
-                    // then or the cap could be exceeded.
-                    let _ = task.await;
-                    return JobOutcome::Retryable(format!("job timed out after {limit:?}"));
-                }
-            },
-            None => (&mut task).await,
-        };
+        let outcome = {
+            let joined = match timeout {
+                Some(limit) => match tokio::time::timeout(limit, &mut task).await {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        task.abort();
+                        // Wait for the cancellation to land: the concurrency permit is
+                        // released when this function returns, so the job must be gone by
+                        // then or the cap could be exceeded.
+                        let _ = task.await;
+                        return (
+                            JobOutcome::Retryable(format!("job timed out after {limit:?}")),
+                            policy,
+                        );
+                    }
+                },
+                None => (&mut task).await,
+            };
 
-        match joined {
-            Ok(Ok(())) => JobOutcome::Success,
-            Ok(Err(JobError::Retryable(e))) => JobOutcome::Retryable(e.to_string()),
-            Ok(Err(JobError::Fatal(e))) => JobOutcome::Fatal(e.to_string()),
-            Ok(Err(JobError::Deferred { delay, reason })) => JobOutcome::Deferred { delay, reason },
-            Err(e) if e.is_panic() => JobOutcome::Retryable("handler panicked".to_owned()),
-            Err(e) => JobOutcome::Retryable(format!("handler task failed: {e}")),
-        }
+            match joined {
+                Ok(Ok(())) => JobOutcome::Success,
+                Ok(Err(JobError::Retryable(e))) => JobOutcome::Retryable(e.to_string()),
+                Ok(Err(JobError::Fatal(e))) => JobOutcome::Fatal(e.to_string()),
+                Ok(Err(JobError::Deferred { delay, reason })) => {
+                    JobOutcome::Deferred { delay, reason }
+                }
+                Err(e) if e.is_panic() => JobOutcome::Retryable("handler panicked".to_owned()),
+                Err(e) => JobOutcome::Retryable(format!("handler task failed: {e}")),
+            }
+        };
+        (outcome, policy)
     }
 }
 
 type HandlerMap = HashMap<&'static str, Arc<dyn ErasedHandler>>;
+
+/// Effective retry policy per `Job::NAME`, resolved once by [`WorkerBuilder::build`].
+type PolicyMap = HashMap<&'static str, RetryPolicy>;
 
 /// Consumes one or more queues of `Q` and dispatches jobs to registered handlers.
 ///
@@ -167,6 +225,8 @@ type HandlerMap = HashMap<&'static str, Arc<dyn ErasedHandler>>;
 pub struct Worker<Q: QueueSet, B: Backend> {
     backend: Arc<B>,
     handlers: Arc<HandlerMap>,
+    policies: Arc<PolicyMap>,
+    dead_letter_hook: Option<Arc<dyn DeadLetterHook>>,
     queues: Vec<QueueConfig>,
     concurrency: usize,
     job_timeout: Option<Duration>,
@@ -186,6 +246,7 @@ impl<Q: QueueSet, B: Backend> std::fmt::Debug for Worker<Q, B> {
             .field("concurrency", &self.concurrency)
             .field("job_timeout", &self.job_timeout)
             .field("close_backend_on_shutdown", &self.close_backend)
+            .field("dead_letter_hook", &self.dead_letter_hook.is_some())
             .finish()
     }
 }
@@ -196,6 +257,9 @@ impl<Q: QueueSet, B: Backend> Worker<Q, B> {
         WorkerBuilder {
             backend,
             handlers: Vec::new(),
+            queue_retry: HashMap::new(),
+            job_retry: HashMap::new(),
+            dead_letter_hook: None,
             queues: None,
             concurrency: None,
             job_timeout: None,
@@ -218,6 +282,15 @@ impl<Q: QueueSet, B: Backend> Worker<Q, B> {
         self.concurrency
     }
 
+    /// The retry policy this worker will actually apply to `job_type`, after the
+    /// builder's overrides were resolved against what the macros declared.
+    ///
+    /// Here so a process that takes its policy from configuration can log or assert
+    /// what it ended up with, rather than trusting that the override matched.
+    pub fn retry_policy_for(&self, job_type: &str) -> Option<&RetryPolicy> {
+        self.policies.get(job_type)
+    }
+
     /// Consume and dispatch until [`WorkerHandle::shutdown`] is called.
     ///
     /// Shutdown is graceful, and in this order:
@@ -237,6 +310,8 @@ impl<Q: QueueSet, B: Backend> Worker<Q, B> {
         let Worker {
             backend,
             handlers,
+            policies,
+            dead_letter_hook,
             queues,
             concurrency,
             job_timeout,
@@ -322,6 +397,8 @@ impl<Q: QueueSet, B: Backend> Worker<Q, B> {
                     in_flight.spawn(process(
                         delivery,
                         handlers.clone(),
+                        policies.clone(),
+                        dead_letter_hook.clone(),
                         job_timeout,
                         settle_failures.clone(),
                         permit,
@@ -348,6 +425,8 @@ impl<Q: QueueSet, B: Backend> Worker<Q, B> {
                     in_flight.spawn(process(
                         delivery,
                         handlers.clone(),
+                        policies.clone(),
+                        dead_letter_hook.clone(),
                         job_timeout,
                         settle_failures.clone(),
                         permit,
@@ -420,9 +499,12 @@ enum ConsumerEvent {
 }
 
 /// Runs one delivery inside a span carrying the job identity.
+#[allow(clippy::too_many_arguments)]
 async fn process(
     delivery: Box<dyn Delivery>,
     handlers: Arc<HandlerMap>,
+    policies: Arc<PolicyMap>,
+    hook: Option<Arc<dyn DeadLetterHook>>,
     timeout: Option<Duration>,
     settle_failures: Arc<AtomicU64>,
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -435,51 +517,79 @@ async fn process(
         queue = %envelope.queue,
         attempt = envelope.attempt,
     );
-    dispatch(delivery, envelope, handlers, timeout, &settle_failures)
-        .instrument(span)
-        .await;
+    dispatch(
+        delivery,
+        envelope,
+        handlers,
+        policies,
+        hook,
+        timeout,
+        &settle_failures,
+    )
+    .instrument(span)
+    .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     delivery: Box<dyn Delivery>,
     envelope: Envelope,
     handlers: Arc<HandlerMap>,
+    policies: Arc<PolicyMap>,
+    hook: Option<Arc<dyn DeadLetterHook>>,
     timeout: Option<Duration>,
     failures: &AtomicU64,
 ) {
     let Some(handler) = handlers.get(envelope.job_type.as_str()).cloned() else {
         warn!("no handler registered; dead-lettering");
-        settle(
-            delivery
-                .dead_letter(&format!("no handler for job type `{}`", envelope.job_type))
-                .await,
-            "dead_letter",
-            failures,
-        );
+        let reason = format!("no handler for job type `{}`", envelope.job_type);
+        // No handler means no policy either, hence `None` for `max_attempts`.
+        notify_dead(&hook, &envelope, DeadLetterCause::NoHandler, &reason, None).await;
+        settle(delivery.dead_letter(&reason).await, "dead_letter", failures);
         return;
     };
 
+    // Resolved once at `build()`; the fallback is unreachable for a registered
+    // handler and only keeps this path total.
+    let configured = policies
+        .get(envelope.job_type.as_str())
+        .cloned()
+        .unwrap_or_else(|| handler.declared_policy());
+
     debug!("running job");
-    match handler.run(&envelope, timeout).await {
+    // `policy` is what the run was actually judged by: `configured`, unless the
+    // handler chose a different one for this particular job.
+    let (outcome, policy) = handler.run(&envelope, timeout, &configured).await;
+    match outcome {
         JobOutcome::Success => {
             info!("job succeeded");
             settle(delivery.ack().await, "ack", failures);
         }
         JobOutcome::Decode(e) => {
             error!(error = %e, "payload did not match the handler's job type");
-            settle(
-                delivery.dead_letter(&format!("decode error: {e}")).await,
-                "dead_letter",
-                failures,
-            );
+            let reason = format!("decode error: {e}");
+            notify_dead(
+                &hook,
+                &envelope,
+                DeadLetterCause::Decode,
+                &reason,
+                Some(policy.max_attempts),
+            )
+            .await;
+            settle(delivery.dead_letter(&reason).await, "dead_letter", failures);
         }
         JobOutcome::Fatal(e) => {
             error!(error = %e, "job failed fatally");
-            settle(
-                delivery.dead_letter(&format!("fatal error: {e}")).await,
-                "dead_letter",
-                failures,
-            );
+            let reason = format!("fatal error: {e}");
+            notify_dead(
+                &hook,
+                &envelope,
+                DeadLetterCause::Fatal,
+                &reason,
+                Some(policy.max_attempts),
+            )
+            .await;
+            settle(delivery.dead_letter(&reason).await, "dead_letter", failures);
         }
         JobOutcome::Deferred { delay, reason } => {
             // Nothing failed: the attempt counter stays put and the retry policy is
@@ -493,27 +603,62 @@ async fn dispatch(
                 failures,
             );
         }
-        JobOutcome::Retryable(e) => {
-            let policy = handler.policy();
-            match policy.decide(envelope.attempt) {
-                RetryDecision::Retry { delay } => {
-                    warn!(error = %e, ?delay, next_attempt = envelope.attempt + 1, "job failed; retrying");
-                    settle(
-                        delivery.retry(envelope.next_attempt(), delay).await,
-                        "retry",
-                        failures,
-                    );
-                }
-                RetryDecision::GiveUp => {
-                    error!(error = %e, max_attempts = policy.max_attempts, "job failed; giving up");
-                    let reason = format!(
-                        "max attempts ({}) exhausted after attempt {}: {e}",
-                        policy.max_attempts, envelope.attempt
-                    );
-                    settle(delivery.dead_letter(&reason).await, "dead_letter", failures);
-                }
+        JobOutcome::Retryable(e) => match policy.decide(envelope.attempt) {
+            RetryDecision::Retry { delay } => {
+                warn!(error = %e, ?delay, next_attempt = envelope.attempt + 1, "job failed; retrying");
+                settle(
+                    delivery.retry(envelope.next_attempt(), delay).await,
+                    "retry",
+                    failures,
+                );
             }
-        }
+            RetryDecision::GiveUp => {
+                error!(error = %e, max_attempts = policy.max_attempts, "job failed; giving up");
+                let reason = format!(
+                    "max attempts ({}) exhausted after attempt {}: {e}",
+                    policy.max_attempts, envelope.attempt
+                );
+                notify_dead(
+                    &hook,
+                    &envelope,
+                    DeadLetterCause::Exhausted,
+                    &reason,
+                    Some(policy.max_attempts),
+                )
+                .await;
+                settle(delivery.dead_letter(&reason).await, "dead_letter", failures);
+            }
+        },
+    }
+}
+
+/// Await the dead-letter hook, if there is one, before the delivery is settled.
+///
+/// Called on every path that dead-letters, so an application learns about jobs that
+/// never reached its code (no handler, undecodable payload) as well as the ones that
+/// failed in it. Running *before* the settle is what makes the notification
+/// at-least-once: if this process dies in between, the broker redelivers the job and
+/// the hook runs again, whereas settling first could drop the notification for a job
+/// that is already gone.
+///
+/// The hook runs in its own task so a panic in it becomes a logged `JoinError`
+/// instead of unwinding the dispatch task and leaving the delivery unsettled.
+async fn notify_dead(
+    hook: &Option<Arc<dyn DeadLetterHook>>,
+    envelope: &Envelope,
+    cause: DeadLetterCause,
+    reason: &str,
+    max_attempts: Option<u32>,
+) {
+    let Some(hook) = hook.clone() else { return };
+    let dead = DeadLetter {
+        envelope: envelope.clone(),
+        cause,
+        reason: reason.to_owned(),
+        max_attempts,
+    };
+    if let Err(e) = tokio::spawn(async move { hook.on_dead_letter(dead).await }).await {
+        error!(error = %e, ?cause, "dead-letter hook panicked; dead-lettering anyway");
     }
 }
 
@@ -533,6 +678,11 @@ fn settle(result: Result<()>, what: &'static str, failures: &AtomicU64) {
 pub struct WorkerBuilder<Q: QueueSet, B: Backend> {
     backend: Arc<B>,
     handlers: Vec<(&'static str, Arc<dyn ErasedHandler>)>,
+    /// Per-queue retry overrides, keyed by broker queue name.
+    queue_retry: HashMap<&'static str, RetryPolicy>,
+    /// Per-job-type retry overrides, keyed by `Job::NAME`. Beat the per-queue ones.
+    job_retry: HashMap<&'static str, RetryPolicy>,
+    dead_letter_hook: Option<Arc<dyn DeadLetterHook>>,
     queues: Option<Vec<Q>>,
     concurrency: Option<usize>,
     job_timeout: Option<Duration>,
@@ -572,6 +722,73 @@ impl<Q: QueueSet, B: Backend> WorkerBuilder<Q, B> {
         self
     }
 
+    /// Replace the retry policy of every job consumed from `queue`, whatever
+    /// `#[queue(retry(...))]` and `#[job(retry(...))]` declared.
+    ///
+    /// The macro grammar fixes a policy at compile time, which is right for the shape
+    /// of a queue's work but wrong for the numbers: how many attempts a flaky
+    /// downstream deserves, and how long to back off, is an operational decision that
+    /// belongs in whatever this process reads its configuration from. Without this,
+    /// changing `max_attempts` means a release.
+    ///
+    /// Overrides are resolved once by [`build`](Self::build) and apply to this worker
+    /// only; a [`Producer`](crate::Producer) never consults a retry policy, and
+    /// another worker on the same queue keeps its own. An override for a queue this
+    /// worker does not consume, or for which no handler is registered, is ignored (it
+    /// is logged at `DEBUG` by `build`). Calling this twice for one queue keeps the
+    /// last policy.
+    ///
+    /// Precedence, highest first: [`job_retry_override`](Self::job_retry_override), this,
+    /// `#[job(retry(...))]`, `#[queue(retry(...))]`.
+    ///
+    /// ```no_run
+    /// # use std::{sync::Arc, time::Duration};
+    /// # use queuey_core::{Backend, QueueSet, RetryPolicy, Worker};
+    /// # async fn example<Q: QueueSet, B: Backend>(backend: Arc<B>, queue: Q) -> queuey_core::Result<()> {
+    /// let attempts = std::env::var("EMAIL_MAX_ATTEMPTS")
+    ///     .ok()
+    ///     .and_then(|v| v.parse().ok())
+    ///     .unwrap_or(5);
+    /// let worker = Worker::<Q, B>::builder(backend)
+    ///     .retry_override(queue, RetryPolicy::fixed(attempts, Duration::from_secs(10)))
+    ///     .build()
+    ///     .await?;
+    /// # let _ = worker; Ok(()) }
+    /// ```
+    pub fn retry_override(mut self, queue: Q, policy: RetryPolicy) -> Self {
+        self.queue_retry.insert(queue.name(), policy);
+        self
+    }
+
+    /// Replace the retry policy of one job type, whatever was declared for it.
+    ///
+    /// Beats [`retry_override`](Self::retry_override) for that job type, so a queue-wide
+    /// override can be set first and one job pulled out of it.
+    pub fn job_retry_override<J>(mut self, policy: RetryPolicy) -> Self
+    where
+        J: Job<Queue = Q>,
+    {
+        self.job_retry.insert(<J as Job>::NAME, policy);
+        self
+    }
+
+    /// Call `hook` for every job this worker dead-letters, whatever the cause.
+    ///
+    /// The one outcome that usually needs acting on (tell the system that enqueued
+    /// the job, alert, mark an endpoint dead) is also the one no handler can observe
+    /// on its own: a job with no handler or an undecodable payload never reaches user
+    /// code, and a handler returning [`JobError::Retryable`](crate::JobError) cannot
+    /// know whether the policy will retry or give up without re-deriving the policy.
+    /// Doing it here means one place instead of that check in every handler.
+    ///
+    /// The hook is awaited *before* the delivery is settled; see
+    /// [`crate::dead_letter`] for what that guarantees and costs. Registering a second
+    /// hook replaces the first.
+    pub fn on_dead_letter<H: DeadLetterHook>(mut self, hook: H) -> Self {
+        self.dead_letter_hook = Some(Arc::new(hook));
+        self
+    }
+
     /// Abort a handler that runs longer than `timeout` and treat it as a retryable failure.
     pub fn job_timeout(mut self, timeout: Duration) -> Self {
         self.job_timeout = Some(timeout);
@@ -601,6 +818,35 @@ impl<Q: QueueSet, B: Backend> WorkerBuilder<Q, B> {
             }
         }
 
+        // Resolve every override once, so dispatch is a map lookup and a policy that
+        // was never applied shows up here rather than as a silent no-op at runtime.
+        let mut policies: PolicyMap = HashMap::with_capacity(handlers.len());
+        for (name, handler) in &handlers {
+            let policy = self
+                .job_retry
+                .get(name)
+                .or_else(|| self.queue_retry.get(handler.queue()))
+                .cloned()
+                .unwrap_or_else(|| handler.declared_policy());
+            policies.insert(*name, policy);
+        }
+        for name in self.job_retry.keys() {
+            if !handlers.contains_key(name) {
+                debug!(
+                    job_type = name,
+                    "retry override for an unregistered job type"
+                );
+            }
+        }
+        for queue in self.queue_retry.keys() {
+            if !handlers.values().any(|h| h.queue() == *queue) {
+                debug!(
+                    queue,
+                    "retry override for a queue with no registered handler"
+                );
+            }
+        }
+
         let selected: Vec<Q> = self.queues.unwrap_or_else(|| Q::all().to_vec());
         let mut queues: Vec<QueueConfig> = Vec::with_capacity(selected.len());
         for queue in selected {
@@ -620,6 +866,8 @@ impl<Q: QueueSet, B: Backend> WorkerBuilder<Q, B> {
         Ok(Worker {
             backend: self.backend,
             handlers: Arc::new(handlers),
+            policies: Arc::new(policies),
+            dead_letter_hook: self.dead_letter_hook,
             queues,
             concurrency,
             job_timeout: self.job_timeout,
@@ -686,6 +934,7 @@ impl std::fmt::Debug for WorkerHandle {
 mod tests {
     use super::*;
     use crate::{
+        dead_letter::FnDeadLetterHook,
         handler::FnHandler,
         memory::MemoryBackend,
         producer::Producer,
@@ -992,7 +1241,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn job_retry_policy_overrides_the_queue_policy() {
+    async fn job_retry_override_overrides_the_queue_policy() {
         let backend = backend();
         let producer = producer(&backend).await;
         let seen = Arc::new(Recorder::default());
@@ -1363,7 +1612,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn deferral_never_consults_the_retry_policy() {
+    async fn deferral_never_consults_the_retry_override() {
         let backend = backend();
         let producer = producer(&backend).await;
         let seen = Arc::new(Recorder::default());
@@ -1940,6 +2189,579 @@ mod tests {
         wait_for(|| greets.attempts() == 1 && pings.attempts() == 2).await;
         assert_eq!(backend.acked(ALPHA).len(), 1);
         assert_eq!(backend.acked(BETA).len(), 2);
+        stop(handle, task).await.unwrap();
+    }
+
+    // ---- runtime retry overrides -------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn a_builder_override_replaces_the_queue_policy() {
+        let backend = backend();
+        let producer = producer(&backend).await;
+        let seen = Arc::new(Recorder::default());
+        let max_attempts = Arc::new(AtomicUsize::new(0));
+
+        let worker = {
+            let (seen, max_attempts) = (seen.clone(), max_attempts.clone());
+            Worker::<TestQueues, _>::builder(backend.clone())
+                // The queue declares three attempts with a one second backoff.
+                .retry_override(TestQueues::Alpha, RetryPolicy::none())
+                .handler(FnHandler::<Greet, _>::new(
+                    move |_job: Greet, ctx: JobContext| {
+                        let (seen, max_attempts) = (seen.clone(), max_attempts.clone());
+                        async move {
+                            seen.enter();
+                            seen.leave();
+                            max_attempts.store(ctx.max_attempts as usize, Ordering::SeqCst);
+                            Err(JobError::retryable_msg("nope"))
+                        }
+                    },
+                ))
+                .build()
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            worker.retry_policy_for(<Greet as Job>::NAME),
+            Some(&RetryPolicy::none()),
+            "the override is resolved at build time"
+        );
+        let (handle, task) = start(worker);
+
+        producer.enqueue(&Greet::new("ada")).await.unwrap();
+        wait_for(|| !backend.dead_letters(ALPHA).is_empty()).await;
+
+        assert_eq!(seen.attempts(), 1, "the override allows a single attempt");
+        assert_eq!(
+            max_attempts.load(Ordering::SeqCst),
+            1,
+            "the handler sees the effective policy, not the declared one"
+        );
+        stop(handle, task).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_override_beats_a_policy_declared_on_the_job() {
+        let backend = backend();
+        let producer = producer(&backend).await;
+        let seen = Arc::new(Recorder::default());
+
+        let worker = {
+            let seen = seen.clone();
+            Worker::<TestQueues, _>::builder(backend.clone())
+                // `Stubborn` declares two attempts of its own; the queue it lives on
+                // declares none. The override outranks both.
+                .retry_override(
+                    TestQueues::Beta,
+                    RetryPolicy::fixed(3, Duration::from_secs(1)),
+                )
+                .handler(FnHandler::<Stubborn, _>::new(
+                    move |_job: Stubborn, _ctx: JobContext| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.enter();
+                            seen.leave();
+                            Err(JobError::retryable_msg("nope"))
+                        }
+                    },
+                ))
+                .build()
+                .await
+                .unwrap()
+        };
+        let (handle, task) = start(worker);
+
+        producer.enqueue(&Stubborn { id: 1 }).await.unwrap();
+        wait_for(|| !backend.dead_letters(BETA).is_empty()).await;
+
+        assert_eq!(seen.attempts(), 3);
+        stop(handle, task).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_job_override_beats_a_queue_override() {
+        let backend = backend();
+        let producer = producer(&backend).await;
+        let seen = Arc::new(Recorder::default());
+
+        let worker = {
+            let seen = seen.clone();
+            Worker::<TestQueues, _>::builder(backend.clone())
+                .retry_override(TestQueues::Alpha, RetryPolicy::none())
+                .job_retry_override::<Greet>(RetryPolicy::fixed(2, Duration::from_secs(1)))
+                .handler(FnHandler::<Greet, _>::new(
+                    move |_job: Greet, _ctx: JobContext| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.enter();
+                            seen.leave();
+                            Err(JobError::retryable_msg("nope"))
+                        }
+                    },
+                ))
+                .build()
+                .await
+                .unwrap()
+        };
+        let (handle, task) = start(worker);
+
+        producer.enqueue(&Greet::new("ada")).await.unwrap();
+        wait_for(|| !backend.dead_letters(ALPHA).is_empty()).await;
+
+        assert_eq!(seen.attempts(), 2, "the per-job override wins");
+        stop(handle, task).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_an_override_the_declared_policy_still_applies() {
+        let backend = backend();
+        let worker = Worker::<TestQueues, _>::builder(backend.clone())
+            .handler(FnHandler::<Greet, _>::new(
+                |_job: Greet, _ctx: JobContext| async move { Ok(()) },
+            ))
+            .handler(FnHandler::<Stubborn, _>::new(
+                |_job: Stubborn, _ctx: JobContext| async move { Ok(()) },
+            ))
+            // An override nothing consumes is inert, not an error.
+            .retry_override(TestQueues::Gamma, RetryPolicy::exponential(9))
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            worker.retry_policy_for(<Greet as Job>::NAME),
+            Some(&TestQueues::Alpha.config().retry),
+            "inherited from the queue"
+        );
+        assert_eq!(
+            worker.retry_policy_for(<Stubborn as Job>::NAME),
+            <Stubborn as Job>::retry_policy().as_ref(),
+            "declared on the job"
+        );
+        assert_eq!(worker.retry_policy_for("test::Nudge"), None);
+    }
+
+    // ---- dead-letter hook --------------------------------------------------------
+
+    /// Collects every [`DeadLetter`] the worker reports.
+    #[derive(Default)]
+    struct DeadLetters(Mutex<Vec<DeadLetter>>);
+
+    impl DeadLetters {
+        fn take(&self) -> Vec<DeadLetter> {
+            self.0.lock().expect("lock poisoned").clone()
+        }
+        fn len(&self) -> usize {
+            self.0.lock().expect("lock poisoned").len()
+        }
+    }
+
+    fn collecting_hook(
+        into: Arc<DeadLetters>,
+    ) -> FnDeadLetterHook<
+        impl Fn(DeadLetter) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync
+        + 'static,
+    > {
+        FnDeadLetterHook::new(move |dead: DeadLetter| {
+            let into = into.clone();
+            Box::pin(async move { into.0.lock().expect("lock poisoned").push(dead) })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_hook_reports_a_job_whose_attempts_ran_out() {
+        let backend = backend();
+        let producer = producer(&backend).await;
+        let dead_letters = Arc::new(DeadLetters::default());
+
+        let worker = Worker::<TestQueues, _>::builder(backend.clone())
+            .on_dead_letter(collecting_hook(dead_letters.clone()))
+            .handler(FnHandler::<Greet, _>::new(
+                |_job: Greet, _ctx: JobContext| async move {
+                    Err(JobError::retryable_msg("still broken"))
+                },
+            ))
+            .build()
+            .await
+            .unwrap();
+        let (handle, task) = start(worker);
+
+        producer.enqueue(&Greet::new("ada")).await.unwrap();
+        wait_for(|| dead_letters.len() == 1).await;
+
+        let reported = dead_letters.take();
+        let dead = &reported[0];
+        assert_eq!(dead.cause, DeadLetterCause::Exhausted);
+        assert!(dead.cause.reached_handler());
+        // The queue allows three attempts, and the third one is what died.
+        assert_eq!(dead.attempts(), 3);
+        assert_eq!(dead.max_attempts, Some(3));
+        assert_eq!(dead.envelope.job_type, <Greet as Job>::NAME);
+        assert!(
+            dead.reason.contains("still broken"),
+            "reason was {:?}",
+            dead.reason
+        );
+        stop(handle, task).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_hook_reports_a_fatal_failure_on_its_first_attempt() {
+        let backend = backend();
+        let producer = producer(&backend).await;
+        let dead_letters = Arc::new(DeadLetters::default());
+
+        let worker = Worker::<TestQueues, _>::builder(backend.clone())
+            .on_dead_letter(collecting_hook(dead_letters.clone()))
+            .handler(FnHandler::<Greet, _>::new(
+                |_job: Greet, _ctx: JobContext| async move { Err(JobError::fatal_msg("bad input")) },
+            ))
+            .build()
+            .await
+            .unwrap();
+        let (handle, task) = start(worker);
+
+        producer.enqueue(&Greet::new("ada")).await.unwrap();
+        wait_for(|| dead_letters.len() == 1).await;
+
+        let reported = dead_letters.take();
+        assert_eq!(reported[0].cause, DeadLetterCause::Fatal);
+        assert_eq!(reported[0].attempts(), 1);
+        assert_eq!(reported[0].max_attempts, Some(3), "the policy went unused");
+        stop(handle, task).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_hook_reports_a_job_no_handler_claimed() {
+        let backend = backend();
+        let producer = producer(&backend).await;
+        let dead_letters = Arc::new(DeadLetters::default());
+
+        let worker = Worker::<TestQueues, _>::builder(backend.clone())
+            .on_dead_letter(collecting_hook(dead_letters.clone()))
+            .handler(FnHandler::<Greet, _>::new(
+                |_job: Greet, _ctx: JobContext| async move { Ok(()) },
+            ))
+            .build()
+            .await
+            .unwrap();
+        let (handle, task) = start(worker);
+
+        // `Orphan` lives on Alpha, which this worker consumes, but has no handler.
+        producer.enqueue(&Orphan { id: 7 }).await.unwrap();
+        wait_for(|| dead_letters.len() == 1).await;
+
+        let reported = dead_letters.take();
+        assert_eq!(reported[0].cause, DeadLetterCause::NoHandler);
+        assert!(!reported[0].cause.reached_handler());
+        assert_eq!(
+            reported[0].max_attempts, None,
+            "no handler, so no policy to report"
+        );
+        assert_eq!(reported[0].envelope.job_type, <Orphan as Job>::NAME);
+        stop(handle, task).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_hook_runs_before_the_delivery_is_settled() {
+        let backend = backend();
+        let producer = producer(&backend).await;
+        let settled_when_hook_ran = Arc::new(AtomicUsize::new(usize::MAX));
+
+        let worker = {
+            let (backend, settled) = (backend.clone(), settled_when_hook_ran.clone());
+            Worker::<TestQueues, _>::builder(backend.clone())
+                .on_dead_letter(FnDeadLetterHook::new(move |_dead: DeadLetter| {
+                    let (backend, settled) = (backend.clone(), settled.clone());
+                    async move {
+                        // Nothing may be on the dead-letter queue yet: losing the
+                        // notification for a job that is already gone is the failure
+                        // mode this ordering exists to prevent.
+                        settled.store(backend.dead_letters(ALPHA).len(), Ordering::SeqCst);
+                    }
+                }))
+                .handler(FnHandler::<Greet, _>::new(
+                    |_job: Greet, _ctx: JobContext| async move {
+                        Err(JobError::fatal_msg("bad input"))
+                    },
+                ))
+                .build()
+                .await
+                .unwrap()
+        };
+        let (handle, task) = start(worker);
+
+        producer.enqueue(&Greet::new("ada")).await.unwrap();
+        wait_for(|| !backend.dead_letters(ALPHA).is_empty()).await;
+
+        assert_eq!(settled_when_hook_ran.load(Ordering::SeqCst), 0);
+        stop(handle, task).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_hook_does_not_stop_the_job_being_dead_lettered() {
+        let backend = backend();
+        let producer = producer(&backend).await;
+
+        let worker = Worker::<TestQueues, _>::builder(backend.clone())
+            .on_dead_letter(FnDeadLetterHook::new(|_dead: DeadLetter| async move {
+                panic!("hook is broken");
+            }))
+            .handler(FnHandler::<Greet, _>::new(
+                |_job: Greet, _ctx: JobContext| async move { Err(JobError::fatal_msg("bad input")) },
+            ))
+            .build()
+            .await
+            .unwrap();
+        let (handle, task) = start(worker);
+
+        producer.enqueue(&Greet::new("ada")).await.unwrap();
+        wait_for(|| !backend.dead_letters(ALPHA).is_empty()).await;
+
+        assert_eq!(handle.settle_failures(), 0, "the delivery still settled");
+        stop(handle, task).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_hook_is_silent_for_jobs_that_succeed_retry_or_defer() {
+        let backend = backend();
+        let producer = producer(&backend).await;
+        let dead_letters = Arc::new(DeadLetters::default());
+        let seen = Arc::new(Recorder::default());
+
+        let worker = {
+            let seen = seen.clone();
+            Worker::<TestQueues, _>::builder(backend.clone())
+                .on_dead_letter(collecting_hook(dead_letters.clone()))
+                .handler(FnHandler::<Greet, _>::new(
+                    move |_job: Greet, _ctx: JobContext| {
+                        let seen = seen.clone();
+                        async move {
+                            match seen.enter() {
+                                1 => Err(JobError::deferred_msg(
+                                    Duration::from_secs(2),
+                                    "rate limited",
+                                )),
+                                2 => Err(JobError::retryable_msg("flaky")),
+                                _ => Ok(()),
+                            }
+                        }
+                    },
+                ))
+                .build()
+                .await
+                .unwrap()
+        };
+        let (handle, task) = start(worker);
+
+        producer.enqueue(&Greet::new("ada")).await.unwrap();
+        wait_for(|| seen.attempts() == 3).await;
+        wait_for(|| backend.acked(ALPHA).len() == 3).await;
+
+        assert_eq!(dead_letters.len(), 0, "nothing was given up on");
+        assert!(backend.dead_letters(ALPHA).is_empty());
+        stop(handle, task).await.unwrap();
+    }
+
+    // ---- per-job policy chosen by the handler ------------------------------------
+
+    /// Handler that is lenient with one payload and strict with every other.
+    struct PickyHandler {
+        lenient: &'static str,
+        seen: Arc<Recorder>,
+        max_attempts: Arc<Mutex<Vec<u32>>>,
+    }
+
+    #[async_trait]
+    impl JobHandler for PickyHandler {
+        type Job = Greet;
+
+        fn set_retry_policy(&self, job: &Greet) -> Option<RetryPolicy> {
+            (job.name == self.lenient).then(|| RetryPolicy::fixed(5, Duration::from_secs(1)))
+        }
+
+        async fn handle(&self, _job: Greet, ctx: JobContext) -> Result<(), JobError> {
+            self.seen.enter();
+            self.seen.leave();
+            self.max_attempts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(ctx.max_attempts);
+            Err(JobError::retryable_msg("nope"))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_handler_can_pick_a_policy_from_the_payload() {
+        let backend = backend();
+        let producer = producer(&backend).await;
+        let seen = Arc::new(Recorder::default());
+        let max_attempts = Arc::new(Mutex::new(Vec::new()));
+
+        let worker = Worker::<TestQueues, _>::builder(backend.clone())
+            .handler(PickyHandler {
+                lenient: "ada",
+                seen: seen.clone(),
+                max_attempts: max_attempts.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let (handle, task) = start(worker);
+
+        // The queue declares three attempts; this payload asks for five.
+        producer.enqueue(&Greet::new("ada")).await.unwrap();
+        wait_for(|| !backend.dead_letters(ALPHA).is_empty()).await;
+        assert_eq!(seen.attempts(), 5);
+
+        let reported = max_attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(
+            reported,
+            vec![5; 5],
+            "the context reports the policy the attempt is judged by"
+        );
+        stop(handle, task).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_payload_the_handler_does_not_single_out_keeps_the_configured_policy() {
+        let backend = backend();
+        let producer = producer(&backend).await;
+        let seen = Arc::new(Recorder::default());
+        let max_attempts = Arc::new(Mutex::new(Vec::new()));
+
+        let worker = Worker::<TestQueues, _>::builder(backend.clone())
+            .handler(PickyHandler {
+                lenient: "ada",
+                seen: seen.clone(),
+                max_attempts: max_attempts.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let (handle, task) = start(worker);
+
+        producer.enqueue(&Greet::new("grace")).await.unwrap();
+        wait_for(|| !backend.dead_letters(ALPHA).is_empty()).await;
+
+        assert_eq!(seen.attempts(), 3, "the queue's three attempts");
+        assert_eq!(
+            max_attempts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            vec![3; 3]
+        );
+        stop(handle, task).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_handler_policy_beats_a_builder_override() {
+        let backend = backend();
+        let producer = producer(&backend).await;
+        let seen = Arc::new(Recorder::default());
+
+        let worker = Worker::<TestQueues, _>::builder(backend.clone())
+            // Most specific wins: the override is about a kind of job, the handler is
+            // answering for this one.
+            .retry_override(TestQueues::Alpha, RetryPolicy::none())
+            .job_retry_override::<Greet>(RetryPolicy::fixed(2, Duration::from_secs(1)))
+            .handler(PickyHandler {
+                lenient: "ada",
+                seen: seen.clone(),
+                max_attempts: Arc::new(Mutex::new(Vec::new())),
+            })
+            .build()
+            .await
+            .unwrap();
+        let (handle, task) = start(worker);
+
+        producer.enqueue(&Greet::new("ada")).await.unwrap();
+        wait_for(|| !backend.dead_letters(ALPHA).is_empty()).await;
+
+        assert_eq!(seen.attempts(), 5);
+        stop(handle, task).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_dead_letter_hook_reports_the_policy_the_handler_chose() {
+        let backend = backend();
+        let producer = producer(&backend).await;
+        let dead_letters = Arc::new(DeadLetters::default());
+
+        let worker = Worker::<TestQueues, _>::builder(backend.clone())
+            .on_dead_letter(collecting_hook(dead_letters.clone()))
+            .handler(PickyHandler {
+                lenient: "ada",
+                seen: Arc::new(Recorder::default()),
+                max_attempts: Arc::new(Mutex::new(Vec::new())),
+            })
+            .build()
+            .await
+            .unwrap();
+        let (handle, task) = start(worker);
+
+        producer.enqueue(&Greet::new("ada")).await.unwrap();
+        wait_for(|| dead_letters.len() == 1).await;
+
+        let dead = &dead_letters.take()[0];
+        assert_eq!(dead.max_attempts, Some(5), "not the queue's three");
+        assert_eq!(dead.attempts(), 5);
+        stop(handle, task).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_correlation_id_reaches_every_attempt_and_the_dead_letter_hook() {
+        let backend = backend();
+        let producer = producer(&backend).await;
+        let dead_letters = Arc::new(DeadLetters::default());
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+
+        let worker = Worker::<TestQueues, _>::builder(backend.clone())
+            .on_dead_letter(collecting_hook(dead_letters.clone()))
+            .handler(FnHandler::<Stubborn, _>::new(
+                move |_job: Stubborn, ctx: JobContext| {
+                    let recorder = recorder.clone();
+                    async move {
+                        recorder.lock().unwrap().push(ctx.correlation_id.clone());
+                        Err(JobError::retryable_msg("always fails"))
+                    }
+                },
+            ))
+            .build()
+            .await
+            .unwrap();
+        let (handle, task) = start(worker);
+
+        producer
+            .enqueue_with(
+                &Stubborn { id: 1 },
+                crate::EnqueueOptions::now().correlation_id("trace-xyz"),
+            )
+            .await
+            .unwrap();
+        wait_for(|| dead_letters.len() == 1).await;
+
+        let attempts = seen.lock().unwrap().clone();
+        assert!(attempts.len() >= 2, "the job was retried: {attempts:?}");
+        assert!(
+            attempts.iter().all(|id| id.as_deref() == Some("trace-xyz")),
+            "every attempt saw the id: {attempts:?}"
+        );
+
+        let dead = &dead_letters.take()[0];
+        assert_eq!(
+            dead.envelope.correlation_id.as_deref(),
+            Some("trace-xyz"),
+            "and so does the hook"
+        );
         stop(handle, task).await.unwrap();
     }
 }

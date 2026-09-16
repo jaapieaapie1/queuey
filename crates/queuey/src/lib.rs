@@ -131,7 +131,11 @@
 //! * [`prelude`]: the one glob import above.
 //! * [`macro@Queues`] / [`macro@Job`]: the full attribute grammar.
 //! * [`Worker`] / [`Producer`]: the runtime.
-//! * [`RetryPolicy`] / [`Backoff`]: retry and backoff semantics.
+//! * [`RetryPolicy`] / [`Backoff`]: retry and backoff semantics, and
+//!   [`WorkerBuilder::retry_override`] / [`WorkerBuilder::job_retry_override`] to replace
+//!   the compiled-in numbers with what this process reads from its configuration.
+//! * [`DeadLetterHook`] (via [`WorkerBuilder::on_dead_letter`]): one callback for every
+//!   job the worker gives up on, including the ones no handler ever saw.
 //! * [`JobError::Deferred`] / [`Producer::defer`]: deferral semantics.
 //! * [`MemoryBackend`]: an in-process backend for tests; see the
 //!   `memory_quickstart` example.

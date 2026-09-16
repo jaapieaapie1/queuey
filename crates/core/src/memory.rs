@@ -15,7 +15,11 @@
 //!   `deferred` and `pending`.
 //! * `dead_letter` moves the envelope into an inspectable `dead_letters(queue)` list with reason.
 //! * Test helpers: `pending(queue) -> usize`, `deferred(queue) -> usize`,
-//!   `dead_letters(queue) -> Vec<(Envelope, String)>`, `acked(queue) -> Vec<Envelope>`.
+//!   `dead_letters(queue) -> Vec<(Envelope, String)>`, `acked(queue) -> Vec<Envelope>`,
+//!   `succeeded(queue) -> Vec<Envelope>`, `retried(queue) -> Vec<Envelope>`,
+//!   `settled(queue) -> Vec<(Envelope, AckKind)>`. `acked` is every attempt an ack
+//!   settled (success, retry *and* deferral), so assert on `succeeded` when the
+//!   question is "did this job succeed"; `settled` carries the [`AckKind`] of each.
 //! * `close` ends all consumer streams. Afterwards `declare`, `publish`, `defer`,
 //!   `retry` and `dead_letter` all fail with [`Error::ShutDown`]; a plain `ack` still
 //!   records. A delayed publish or a deferral whose timer fires *after* the close is
@@ -50,14 +54,37 @@ use crate::{
     queue::QueueConfig,
 };
 
+/// Why a delivery attempt was acked.
+///
+/// Three different outcomes all end in an ack on the wire: the job succeeded, a retry
+/// was scheduled, or a deferral was held. The ack alone cannot tell them apart.
+/// Recording the reason is what lets [`MemoryBackend::succeeded`] mean "the handler
+/// returned `Ok(())`" while [`MemoryBackend::acked`] keeps meaning "settled by an ack".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum AckKind {
+    /// The handler returned `Ok(())` and [`Delivery::ack`] settled the attempt. This is
+    /// the only kind that means the job is done.
+    Succeeded,
+    /// [`Delivery::retry`] acked the original because a successor was published for a
+    /// later attempt. The job is not done: a copy with `attempt + 1` follows.
+    Retried,
+    /// [`Delivery::defer`] acked the original because a successor was put in hold. The
+    /// job is not done, and its `attempt` has not moved, because a deferral is not a
+    /// retry.
+    Deferred,
+}
+
 /// State of one queue inside the backend.
 struct QueueState {
     /// Config from the first `declare` (or a default one, for implicit queues).
     config: QueueConfig,
     /// Messages waiting to be handed to a consumer.
     pending: VecDeque<Envelope>,
-    /// Everything that was acked, in ack order (retries count as an ack of the original).
-    acked: Vec<Envelope>,
+    /// Every attempt an ack settled, in settle order, each with the reason it was
+    /// acked. One list rather than three keeps the ordering across kinds meaningful,
+    /// which is what [`MemoryBackend::settled`] reports; the other helpers project it.
+    settled: Vec<(Envelope, AckKind)>,
     /// Everything that was dead-lettered, with its reason.
     dead: Vec<(Envelope, String)>,
     /// One semaphore per live consumer; closing it stops that consumer.
@@ -75,7 +102,7 @@ impl QueueState {
         Self {
             config,
             pending: VecDeque::new(),
-            acked: Vec::new(),
+            settled: Vec::new(),
             dead: Vec::new(),
             consumers: Vec::new(),
             held: 0,
@@ -164,15 +191,72 @@ impl MemoryBackend {
         self.lock().queues.get(queue).map_or(0, |q| q.pending.len())
     }
 
-    /// Envelopes that were acked on `queue`, in ack order.
+    /// Every delivery attempt on `queue` that was settled by an ack, in settle order.
     ///
-    /// A successful [`Delivery::retry`] acks the original envelope, so it shows up here
-    /// too (the rescheduled copy arrives separately with `attempt + 1`).
+    /// An ack is how *three* different outcomes end: the handler succeeded, a retry was
+    /// scheduled ([`Delivery::retry`] acks the original), or a deferral was held
+    /// ([`Delivery::defer`] does the same). So this counts attempts, not successes: a
+    /// job that fails twice and then succeeds appears here three times, and one that
+    /// exhausts its attempts and dead-letters appears once per attempt *except* the
+    /// last, which is a dead letter and not an ack at all.
+    ///
+    /// For "did this job actually succeed", use [`MemoryBackend::succeeded`]; for the
+    /// reason behind each ack, [`MemoryBackend::settled`].
     pub fn acked(&self, queue: &str) -> Vec<Envelope> {
+        self.settled_by(queue, None)
+    }
+
+    /// Envelopes acked by [`Delivery::ack`] on `queue`, in ack order: the attempts whose
+    /// handler returned `Ok(())`.
+    ///
+    /// This is what most assertions actually mean by "acked". It excludes the acks that
+    /// retries and deferrals perform on the original envelope, so its length is the
+    /// number of jobs that finished successfully, not the number of attempts made.
+    pub fn succeeded(&self, queue: &str) -> Vec<Envelope> {
+        self.settled_by(queue, Some(AckKind::Succeeded))
+    }
+
+    /// Envelopes acked on `queue` because [`Delivery::retry`] scheduled a further
+    /// attempt, in retry order.
+    ///
+    /// One entry per failed-and-rescheduled attempt, carrying the `attempt` the handler
+    /// saw; the rescheduled copy arrives separately with `attempt + 1`. Use it to assert
+    /// how many times a job was retried without counting its final outcome.
+    pub fn retried(&self, queue: &str) -> Vec<Envelope> {
+        self.settled_by(queue, Some(AckKind::Retried))
+    }
+
+    /// Every ack on `queue` with the reason it happened, in settle order.
+    ///
+    /// The full record the other three helpers project from, for tests that care about
+    /// the *sequence* of outcomes ("retried, retried, succeeded"), which neither a
+    /// count nor a single filtered list can show.
+    ///
+    /// Note that the [`AckKind::Deferred`] entries here are the *originals* that a
+    /// deferral acked; they are a historical record and do not shrink. That is a
+    /// different thing from [`MemoryBackend::deferred`], which counts the successor
+    /// envelopes sitting in hold right now and drops back to zero as the holds expire.
+    pub fn settled(&self, queue: &str) -> Vec<(Envelope, AckKind)> {
         self.lock()
             .queues
             .get(queue)
-            .map(|q| q.acked.clone())
+            .map(|q| q.settled.clone())
+            .unwrap_or_default()
+    }
+
+    /// Shared projection behind `acked` / `succeeded` / `retried`: every settled
+    /// envelope, or only those with `kind`, under one lock.
+    fn settled_by(&self, queue: &str, kind: Option<AckKind>) -> Vec<Envelope> {
+        self.lock()
+            .queues
+            .get(queue)
+            .map(|q| {
+                q.settled
+                    .iter()
+                    .filter(|(_, recorded)| kind.is_none_or(|kind| *recorded == kind))
+                    .map(|(envelope, _)| envelope.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -182,6 +266,9 @@ impl MemoryBackend {
     /// whose delay has not elapsed: they are not `pending` yet and no consumer can see
     /// them. The count drops back to zero as each hold expires or, if the backend
     /// was closed in the meantime, as each held envelope is dropped.
+    ///
+    /// A live count, not a history: for the attempts that *caused* a deferral, look for
+    /// [`AckKind::Deferred`] in [`MemoryBackend::settled`].
     pub fn deferred(&self, queue: &str) -> usize {
         self.lock().queues.get(queue).map_or(0, |q| q.held)
     }
@@ -511,12 +598,14 @@ struct MemoryDelivery {
 }
 
 impl MemoryDelivery {
-    fn record_ack(&self) {
+    /// Record this attempt as settled by an ack, and why: the `kind` is what tells a
+    /// test a success apart from the ack that a retry or deferral performs.
+    fn record_ack(&self, kind: AckKind) {
         let mut shared = MemoryBackend::lock_shared(&self.state);
         shared
             .queue_mut(&self.envelope.queue)
-            .acked
-            .push(self.envelope.clone());
+            .settled
+            .push((self.envelope.clone(), kind));
     }
 }
 
@@ -527,7 +616,7 @@ impl Delivery for MemoryDelivery {
     }
 
     async fn ack(self: Box<Self>) -> Result<()> {
-        self.record_ack();
+        self.record_ack(AckKind::Succeeded);
         Ok(())
     }
 
@@ -551,7 +640,7 @@ impl Delivery for MemoryDelivery {
         }
         // Schedule first, ack second: never lose the message.
         MemoryBackend::schedule(&self.state, next, delay);
-        self.record_ack();
+        self.record_ack(AckKind::Retried);
         Ok(())
     }
 
@@ -564,7 +653,7 @@ impl Delivery for MemoryDelivery {
         // Hold first, ack second: never lose the message. Dropping `self` afterwards
         // releases the prefetch permit, exactly as `retry` does.
         MemoryBackend::hold(&self.state, next, delay);
-        self.record_ack();
+        self.record_ack(AckKind::Deferred);
         Ok(())
     }
 }
@@ -1363,5 +1452,130 @@ mod tests {
         let envelope = delivery.envelope().clone();
         delivery.ack().await.unwrap();
         assert_eq!(backend.acked("test.alpha"), vec![envelope]);
+    }
+
+    #[tokio::test]
+    async fn a_plain_ack_is_both_acked_and_succeeded() {
+        let backend = declared().await;
+        let original = publish(&backend, "fine").await;
+        let mut stream = backend.consume(&alpha()).await.unwrap();
+
+        next_delivery(&mut stream).await.ack().await.unwrap();
+
+        assert_eq!(backend.acked("test.alpha").len(), 1);
+        let succeeded = backend.succeeded("test.alpha");
+        assert_eq!(succeeded.len(), 1);
+        assert_eq!(succeeded[0].job_id, original.job_id);
+        assert!(backend.retried("test.alpha").is_empty());
+        assert_eq!(
+            backend.settled("test.alpha")[0].1,
+            AckKind::Succeeded,
+            "an ack from a handler that returned Ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retried_attempt_is_acked_but_never_succeeded() {
+        let backend = declared().await;
+        let original = publish(&backend, "flaky").await;
+        let mut stream = backend.consume(&alpha()).await.unwrap();
+
+        // Two failures, then the attempts run out and the job is dead-lettered: the
+        // shape a "fails N times then gives up" test asserts on.
+        for _ in 0..2 {
+            let delivery = next_delivery(&mut stream).await;
+            let next = delivery.envelope().next_attempt();
+            delivery.retry(next, Duration::ZERO).await.unwrap();
+        }
+        next_delivery(&mut stream)
+            .await
+            .dead_letter("max attempts (3) exhausted")
+            .await
+            .unwrap();
+
+        // Three attempts were made, but only the first two ended in an ack, and none of
+        // them succeeded.
+        assert_eq!(backend.acked("test.alpha").len(), 2);
+        let retried = backend.retried("test.alpha");
+        assert_eq!(retried.len(), 2);
+        assert_eq!(
+            retried.iter().map(|e| e.attempt).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(retried.iter().all(|e| e.job_id == original.job_id));
+        assert!(
+            backend.succeeded("test.alpha").is_empty(),
+            "the job never succeeded, so `succeeded` must stay empty"
+        );
+        assert_eq!(backend.dead_letters("test.alpha").len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_deferred_attempt_is_acked_but_never_succeeded() {
+        let backend = declared().await;
+        let original = publish(&backend, "rate-limited").await;
+        let mut stream = backend.consume(&alpha()).await.unwrap();
+
+        let delivery = next_delivery(&mut stream).await;
+        let next = delivery.envelope().deferred(10);
+        delivery.defer(next, Duration::from_secs(30)).await.unwrap();
+
+        assert_eq!(backend.acked("test.alpha").len(), 1);
+        assert!(backend.succeeded("test.alpha").is_empty());
+        assert!(backend.retried("test.alpha").is_empty());
+        let settled = backend.settled("test.alpha");
+        assert_eq!(settled[0].1, AckKind::Deferred);
+        assert_eq!(settled[0].0.job_id, original.job_id);
+        // The live hold count and the ack record are different things: the first drops
+        // back to zero when the hold expires, the second does not.
+        assert_eq!(backend.deferred("test.alpha"), 1);
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert_eq!(backend.deferred("test.alpha"), 0);
+        assert_eq!(backend.settled("test.alpha").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn settled_reports_every_ack_in_order_with_its_kind() {
+        let backend = declared().await;
+        publish(&backend, "eventually").await;
+        let mut stream = backend.consume(&alpha()).await.unwrap();
+
+        // Fail once, then ask to be deferred, then succeed. Zero delays so the copies
+        // come back without any time to advance.
+        let first = next_delivery(&mut stream).await;
+        let next = first.envelope().next_attempt();
+        first.retry(next, Duration::ZERO).await.unwrap();
+
+        let second = next_delivery(&mut stream).await;
+        let next = second.envelope().deferred(10);
+        second.defer(next, Duration::ZERO).await.unwrap();
+
+        next_delivery(&mut stream).await.ack().await.unwrap();
+
+        let kinds: Vec<_> = backend
+            .settled("test.alpha")
+            .into_iter()
+            .map(|(envelope, kind)| (envelope.attempt, kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (1, AckKind::Retried),
+                (2, AckKind::Deferred),
+                (2, AckKind::Succeeded),
+            ],
+            "a deferral does not advance the attempt, a retry does"
+        );
+        assert_eq!(backend.acked("test.alpha").len(), 3);
+        assert_eq!(backend.succeeded("test.alpha").len(), 1);
+        assert_eq!(backend.retried("test.alpha").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_new_helpers_are_empty_for_an_unknown_queue() {
+        let backend = MemoryBackend::new();
+        assert!(backend.succeeded("never.declared").is_empty());
+        assert!(backend.retried("never.declared").is_empty());
+        assert!(backend.settled("never.declared").is_empty());
     }
 }

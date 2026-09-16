@@ -5,10 +5,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::{error::JobError, job::Job};
+use crate::{error::JobError, job::Job, retry::RetryPolicy};
 
 /// Metadata about the current execution, available to handlers.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct JobContext {
     /// Stable id of the job, unchanged across retries.
     pub job_id: Uuid,
@@ -29,6 +30,10 @@ pub struct JobContext {
     pub priority: u8,
     /// Time since first enqueue.
     pub age: Duration,
+    /// The correlation id the job was enqueued with, if any. Set through
+    /// [`EnqueueOptions::correlation_id`](crate::EnqueueOptions::correlation_id),
+    /// carried across retries and deferrals, never interpreted by the library.
+    pub correlation_id: Option<String>,
 }
 
 impl JobContext {
@@ -46,6 +51,72 @@ pub trait JobHandler: Send + Sync + 'static {
 
     /// Process one job. Returning `Err` hands control to the retry policy.
     async fn handle(&self, job: Self::Job, ctx: JobContext) -> Result<(), JobError>;
+
+    /// Choose a retry policy for *this* job, looking at its decoded payload.
+    ///
+    /// Every other way of configuring retries answers "how do jobs of this kind
+    /// behave"; this one answers "how does this particular job behave", which is the
+    /// question a payload often decides. Webhook deliveries are the motivating case:
+    /// the endpoint that has been flaky since it was onboarded earns ten attempts
+    /// over an hour, a brand new one gets three, and both are the same job type on
+    /// the same queue. The handler has `&self`, so the answer can come from whatever
+    /// configuration or client the handler was built with.
+    ///
+    /// Returning `None` (the default) keeps the configured policy, resolved from
+    /// [`WorkerBuilder::job_retry_override`](crate::WorkerBuilder::job_retry_override),
+    /// [`WorkerBuilder::retry_override`](crate::WorkerBuilder::retry_override),
+    /// `#[job(retry(...))]` and `#[queue(retry(...))]` in that order. A `Some` beats
+    /// all four: it is the most specific statement available, and it is the one the
+    /// consuming process makes about work it is holding in its hands.
+    ///
+    /// Called once per delivery, after the payload decodes and before
+    /// [`handle`](Self::handle), so [`JobContext::max_attempts`] and
+    /// [`JobContext::is_last_attempt`] already reflect what this returned. It runs on
+    /// every attempt, and nothing pins it to the answer it gave last time: returning a
+    /// policy with fewer attempts than the job has already made retires that job on
+    /// its next failure, which is a reasonable way to stop a retry storm and a
+    /// surprising way to lose work. Keep it cheap and side-effect free: it is not
+    /// async, so it cannot do I/O.
+    ///
+    /// ```
+    /// # use queuey_core::{Job, JobContext, JobError, JobHandler, RetryPolicy, async_trait};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    /// # enum Q { Webhooks }
+    /// # impl queuey_core::QueueSet for Q {
+    /// #     fn all() -> &'static [Self] { &[Q::Webhooks] }
+    /// #     fn name(&self) -> &'static str { "webhooks" }
+    /// #     fn config(&self) -> queuey_core::QueueConfig { queuey_core::QueueConfig::new("webhooks") }
+    /// # }
+    /// # #[derive(Serialize, Deserialize)]
+    /// # struct Deliver { endpoint: String }
+    /// # impl Job for Deliver {
+    /// #     type Queue = Q;
+    /// #     const NAME: &'static str = "Deliver";
+    /// #     const QUEUE: Q = Q::Webhooks;
+    /// # }
+    /// struct Webhooks { lenient: Vec<String> }
+    ///
+    /// #[async_trait]
+    /// impl JobHandler for Webhooks {
+    ///     type Job = Deliver;
+    ///
+    ///     fn set_retry_policy(&self, job: &Deliver) -> Option<RetryPolicy> {
+    ///         self.lenient
+    ///             .contains(&job.endpoint)
+    ///             .then(|| RetryPolicy::exponential(10))
+    ///     }
+    ///
+    ///     async fn handle(&self, job: Deliver, ctx: JobContext) -> Result<(), JobError> {
+    ///         # let _ = (job, ctx);
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
+    fn set_retry_policy(&self, job: &Self::Job) -> Option<RetryPolicy> {
+        let _ = job;
+        None
+    }
 }
 
 /// Blanket adapter so plain async closures can be handlers:
