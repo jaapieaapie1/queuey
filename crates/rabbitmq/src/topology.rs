@@ -61,6 +61,21 @@
 //!
 //! Everything in this module is pure: it never touches a connection, so it can
 //! be unit-tested without a broker.
+//!
+//! # What is public here, and why only that
+//!
+//! The queue *names* ([`dead_queue_name`], [`deferred_queue_name`],
+//! [`deferred_ttl_ms`]) and the argument/header key constants are public: they
+//! are wire format an operator already sees in the management UI, and tooling
+//! that monitors `q.dead` depth or cleans up stale hold queues needs to compute
+//! them exactly as this backend does.
+//!
+//! The functions that build the declaration *arguments* are crate-private,
+//! because they return `lapin` `FieldTable`s. Exporting a `lapin` type in a
+//! signature would pin this crate's 1.x line to one `lapin` major version, and
+//! the arguments are not a knob in any case: they are a pure function of the
+//! queue name (see above), so there is nothing downstream could usefully do
+//! with them that would not risk a `PRECONDITION_FAILED`.
 
 use std::time::Duration;
 
@@ -231,7 +246,7 @@ pub fn deferred_ttl_ms(delay: Duration, granularity: Duration) -> Option<u32> {
 /// Adding `x-max-priority` to a queue that predates this feature therefore
 /// requires deleting the queue or setting `max_priority = 0`.
 #[must_use]
-pub fn queue_args(config: &QueueConfig) -> FieldTable {
+pub(crate) fn queue_args(config: &QueueConfig) -> FieldTable {
     let mut args = FieldTable::default();
     if let Some(ttl) = config.message_ttl {
         args.insert(
@@ -268,7 +283,7 @@ pub fn queue_args(config: &QueueConfig) -> FieldTable {
 /// Never carries `x-max-priority`: a hold queue must stay FIFO, and the priority
 /// only matters once the message is back on `q`.
 #[must_use]
-pub fn deferred_queue_args(config: &QueueConfig, ttl_ms: u32) -> FieldTable {
+pub(crate) fn deferred_queue_args(config: &QueueConfig, ttl_ms: u32) -> FieldTable {
     let mut args = FieldTable::default();
     args.insert(
         ARG_MESSAGE_TTL.into(),
@@ -316,7 +331,7 @@ pub(crate) fn declare_options(durable: bool) -> QueueDeclareOptions {
 /// Deliberately empty: dead-lettered messages are terminal and must not expire
 /// or be routed onwards without an operator looking at them.
 #[must_use]
-pub fn dead_queue_args(_config: &QueueConfig) -> FieldTable {
+pub(crate) fn dead_queue_args(_config: &QueueConfig) -> FieldTable {
     FieldTable::default()
 }
 

@@ -32,18 +32,21 @@ use crate::{
 
 /// A [`Backend`] backed by a single RabbitMQ connection.
 ///
-/// * One [`Connection`].
-/// * One publishing [`Channel`] in confirm mode, shared behind a
-///   [`tokio::sync::Mutex`]. Every publish (enqueue, retry, defer, dead-letter)
-///   is `mandatory` and waits for the broker's confirmation. The channel is
-///   reopened lazily if a channel exception closed it. Nothing is ever
-///   *declared* on it.
-/// * One long-lived [`Channel`] for the hold queue declarations every retry,
+/// * One AMQP `Connection`.
+/// * A small pool of publishing `Channel`s in confirm mode, at most
+///   [`RabbitMqOptions::publish_concurrency`] of them, shared by everything
+///   that publishes. Every publish (enqueue, retry, defer, dead-letter) is
+///   `mandatory`, takes one channel of the pool and holds it until the broker
+///   confirms, because a channel with two publishes outstanding cannot say
+///   whose `basic.return` is whose — and mistaking one for the other loses
+///   jobs. Channels are opened on demand and reopened lazily if a channel
+///   exception closed them. Nothing is ever *declared* on them.
+/// * One long-lived `Channel` for the hold queue declarations every retry,
 ///   delayed publish and [`defer`](Backend::defer) makes on demand. A
 ///   declaration is the one thing the broker routinely refuses
 ///   (`PRECONDITION_FAILED` closes the channel it ran on), so it is kept away
 ///   from the publishes it would otherwise take down with it.
-/// * One fresh [`Channel`] per [`consume`](Backend::consume) call, so each
+/// * One fresh `Channel` per [`consume`](Backend::consume) call, so each
 ///   consumer gets its own `basic_qos` prefetch window and a failure on one
 ///   consumer cannot take down the others.
 /// * One short-lived channel per [`declare`](Backend::declare) call, so a
@@ -51,12 +54,12 @@ use crate::{
 ///   arguments, which RabbitMQ answers with `PRECONDITION_FAILED` and closes the
 ///   channel) cannot poison the other channels.
 ///
-/// Those are the channels the backend owns. An application whose own queues sit
-/// on the same vhost as its jobs can work them without a second connection:
-/// [`create_channel`](Self::create_channel) hands out a channel on this one.
-/// Such a channel is the caller's to use, close and, because it does not come
-/// back after a reconnect, reopen; see
-/// [`connection_generation`](Self::connection_generation).
+/// Those channels are the backend's own, and there is no way to borrow one or
+/// the connection under them: no method here returns a `lapin` type, so a
+/// `lapin` major release cannot force one of this crate. An application that
+/// also speaks plain AMQP opens its own connection. The only handshake detail
+/// worth steering from out here is the connection's name, which
+/// [`RabbitMqOptions::connection_name`] sets.
 ///
 /// # Reconnection
 ///
@@ -143,128 +146,6 @@ impl RabbitMqBackend {
     #[must_use]
     pub fn is_connected(&self) -> bool {
         self.connection.is_connected()
-    }
-
-    /// Open a fresh [`Channel`] on the connection this backend is using,
-    /// waiting for a reconnect first if that connection is currently down.
-    ///
-    /// # It reaches one vhost: this backend's
-    ///
-    /// A [`Connection`] is bound to the vhost in the URI it was dialled with, so
-    /// this channel can only ever see queues on the backend's own vhost. Keeping
-    /// application messaging on a *separate* vhost is a good default and the one
-    /// this library assumes, because it walls job traffic, the dead-letter and
-    /// hold queues it creates, and the permissions they need off from everything
-    /// else. An application that does that still needs a connection of its own
-    /// for its queues. It should open one; this method cannot reach them.
-    ///
-    /// What this is for is the other arrangement: job queues and application
-    /// queues deliberately sharing one vhost. There a second connection to the
-    /// same broker and the same vhost buys nothing but another socket, another
-    /// set of credentials, another reconnect loop and another thing to remember
-    /// to close, while this channel rides the connection the backend already
-    /// keeps alive.
-    ///
-    /// # The channel is yours, and it does not outlive its connection
-    ///
-    /// What comes back is a plain [`lapin::Channel`] that the backend does not
-    /// track, reopen or close. Closing it (or dropping it) is the caller's
-    /// business, and so is its fate after an outage: unlike the backend's own
-    /// channels, consumers and queues, which are rebuilt on the replacement
-    /// connection, this channel dies with the connection it was opened on and
-    /// nothing brings it back. A caller that means to outlive a broker restart
-    /// has to notice and open a new one, which is what
-    /// [`connection_generation`](Self::connection_generation) is for: remember
-    /// the number this channel was opened on, and a different number later means
-    /// the channel is gone and its consumers with it.
-    ///
-    /// # Do not collide with the library's topology
-    ///
-    /// Declare only queues that are yours. Re-declaring `q`, `q.dead` or
-    /// `q.deferred.{ttl_ms}` (see [`topology`]) with arguments that differ by so
-    /// much as one value is answered with `PRECONDITION_FAILED`, which closes
-    /// the channel it ran on and, for a hold queue, keeps failing every retry
-    /// and deferral until somebody deletes the queue. The backend's own queue
-    /// names are available from [`dead_queue_name`](Self::dead_queue_name) and
-    /// [`deferred_queue_name`](Self::deferred_queue_name) if you need to be sure
-    /// you are steering clear of them.
-    ///
-    /// ```no_run
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// use futures::StreamExt;
-    /// use lapin::{
-    ///     options::{BasicAckOptions, BasicConsumeOptions, QueueDeclareOptions},
-    ///     types::FieldTable,
-    /// };
-    /// use queuey_rabbitmq::RabbitMqBackend;
-    ///
-    /// let backend = RabbitMqBackend::connect("amqp://guest:guest@localhost:5672/%2f").await?;
-    /// // ... declare the job queues and run a worker on `backend` as usual ...
-    ///
-    /// // An ingress queue another system publishes to, on the same connection.
-    /// let opened_on = backend.connection_generation();
-    /// let channel = backend.create_channel().await?;
-    /// channel
-    ///     .queue_declare(
-    ///         "orders.ingress".into(),
-    ///         QueueDeclareOptions {
-    ///             durable: true,
-    ///             ..Default::default()
-    ///         },
-    ///         FieldTable::default(),
-    ///     )
-    ///     .await?;
-    /// let mut consumer = channel
-    ///     .basic_consume(
-    ///         "orders.ingress".into(),
-    ///         "orders-ingress".into(),
-    ///         BasicConsumeOptions::default(),
-    ///         FieldTable::default(),
-    ///     )
-    ///     .await?;
-    ///
-    /// while let Some(delivery) = consumer.next().await {
-    ///     let delivery = delivery?;
-    ///     // ... hand the body to the application ...
-    ///     delivery.acker.ack(BasicAckOptions::default()).await?;
-    /// }
-    ///
-    /// // The consumer ended. If the connection was replaced underneath it, this
-    /// // channel is gone for good; the backend recovered, this did not.
-    /// if backend.connection_generation() != opened_on {
-    ///     let _channel = backend.create_channel().await?;
-    ///     // ... and resubscribe on it.
-    /// }
-    /// # Ok(()) }
-    /// ```
-    pub async fn create_channel(&self) -> Result<Channel> {
-        let live = self.connection.ensure_connected().await?;
-        live.create_channel().await.map_err(amqp)
-    }
-
-    /// How many connections this backend has had, the first one included.
-    ///
-    /// It starts at `1` and goes up by one every time a dropped connection is
-    /// replaced, so it is the answer to "is this still the connection I was
-    /// given?", the question every user of
-    /// [`create_channel`](Self::create_channel) eventually has. A channel opened
-    /// there belongs to exactly one connection: the backend rebuilds *its*
-    /// channels, consumers and queue declarations on the replacement, but not
-    /// that one, which is closed by the broker along with everything else on the
-    /// dead socket. Nothing tells its holder so, because a channel has no such
-    /// signal; a stalled consumer and a number that has moved on is what it
-    /// looks like.
-    ///
-    /// So a caller records this number when it opens a channel and compares it
-    /// later, periodically or whenever its own consumer ends or a publish
-    /// fails. A different number means: that channel is dead, open another with
-    /// `create_channel` and redo the declarations and subscriptions that were on
-    /// it. An unchanged number means the channel is as good as it ever was.
-    ///
-    /// This never itself triggers a reconnect, so it is safe to poll.
-    #[must_use]
-    pub fn connection_generation(&self) -> u64 {
-        self.connection.generation()
     }
 
     /// The options this backend was built with.

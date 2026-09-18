@@ -74,7 +74,16 @@ pub enum JobError {
     ///
     /// There is no built-in cap: a handler that wants one inspects
     /// [`crate::JobContext::deferrals`] and returns [`JobError::Fatal`] instead.
+    ///
+    /// `#[non_exhaustive]` on the *variant*, not just the enum: a handler
+    /// returns this by name, and a deferral is the outcome most likely to gain
+    /// detail (a deadline, a resource key a scheduler could group on) without
+    /// the enum gaining a variant. Build one with
+    /// [`JobError::deferred`](Self::deferred) or
+    /// [`JobError::deferred_msg`](Self::deferred_msg), and match it with a `..`
+    /// rest pattern, so adding a field stays a minor release.
     #[error("job deferred for {delay:?}: {reason}")]
+    #[non_exhaustive]
     Deferred {
         /// How long the job must wait before it is delivered again.
         delay: std::time::Duration,

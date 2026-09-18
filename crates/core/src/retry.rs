@@ -13,6 +13,20 @@ pub enum Backoff {
     /// Constant delay between attempts.
     Fixed(Duration),
     /// `delay = min(max, base * factor^(attempt-1))`, optionally with full jitter.
+    ///
+    /// `#[non_exhaustive]` on the *variant*, not just the enum: the enum
+    /// attribute only reserves the right to add variants, and a curve gains
+    /// knobs (a floor, a decorrelated-jitter mode) far more readily than the
+    /// enum gains shapes. Build one with
+    /// [`Backoff::exponential_with`](Self::exponential_with) or
+    /// [`Backoff::exponential`](Self::exponential), and match it with a `..`
+    /// rest pattern, so that adding a field stays a minor release.
+    ///
+    /// A [`RetryPolicy`] is often persisted (it is `Serialize`/`Deserialize`),
+    /// so any field added here in 1.x also carries `#[serde(default)]`, exactly
+    /// like [`crate::Envelope`]: a configuration written by an older build has
+    /// to keep decoding.
+    #[non_exhaustive]
     Exponential {
         /// Delay used for the first retry (after attempt 1 failed).
         base: Duration,
@@ -28,11 +42,42 @@ pub enum Backoff {
 impl Backoff {
     /// Sensible exponential default: 1s base, x2, capped at 5 minutes, jittered.
     pub fn exponential() -> Self {
+        Self::exponential_with(Duration::from_secs(1), 2.0, Duration::from_secs(300), true)
+    }
+
+    /// An exponential curve with every knob stated.
+    ///
+    /// [`Backoff::Exponential`] is `#[non_exhaustive]`, so a struct literal is
+    /// not available outside this crate; this is the way to spell a fully tuned
+    /// curve, and it is what `#[queue(retry(...))]` / `#[job(retry(...))]`
+    /// generate. [`Backoff::exponential`] remains the shortcut for the defaults.
+    ///
+    /// Nothing is validated here on purpose: a degenerate `factor` (zero,
+    /// negative, `NaN`) collapses to a constant `base` and a `max` below `base`
+    /// simply caps at `max`, because [`Backoff::delay_for`] must never panic on
+    /// a value that came out of a config file. The derives, which see the values
+    /// at compile time, reject those instead.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use queuey_core::Backoff;
+    ///
+    /// let backoff = Backoff::exponential_with(
+    ///     Duration::from_millis(250),
+    ///     1.5,
+    ///     Duration::from_secs(60),
+    ///     false,
+    /// );
+    /// assert_eq!(backoff.delay_for(1), Duration::from_millis(250));
+    /// assert_eq!(backoff.delay_for(2), Duration::from_millis(375));
+    /// ```
+    #[must_use]
+    pub fn exponential_with(base: Duration, factor: f64, max: Duration, jitter: bool) -> Self {
         Self::Exponential {
-            base: Duration::from_secs(1),
-            factor: 2.0,
-            max: Duration::from_secs(300),
-            jitter: true,
+            base,
+            factor,
+            max,
+            jitter,
         }
     }
 
@@ -69,12 +114,33 @@ impl Default for RetryPolicy {
 #[non_exhaustive]
 pub enum RetryDecision {
     /// Re-publish after `delay`.
+    ///
+    /// `#[non_exhaustive]` on the variant so this can later say *where* to
+    /// republish, or at what priority, without a major version. Build one with
+    /// [`RetryDecision::retry`](Self::retry) and match it with a `..` rest
+    /// pattern.
+    #[non_exhaustive]
     Retry {
         /// How long to wait before the next attempt.
         delay: Duration,
     },
     /// Attempts exhausted; dead-letter.
     GiveUp,
+}
+
+impl RetryDecision {
+    /// Retry after `delay`.
+    ///
+    /// The library produces these; you normally only match on them. The
+    /// constructor exists because [`RetryDecision`] is [`PartialEq`], so the
+    /// natural way to test a policy is
+    /// `assert_eq!(policy.decide(1), RetryDecision::retry(delay))`, and the
+    /// `#[non_exhaustive]` variant would otherwise put that out of reach
+    /// downstream.
+    #[must_use]
+    pub fn retry(delay: Duration) -> Self {
+        Self::Retry { delay }
+    }
 }
 
 impl RetryPolicy {
@@ -379,6 +445,66 @@ mod tests {
         assert_eq!(p.max_attempts, 1);
         assert_eq!(p.backoff, Backoff::None);
         assert_eq!(p.decide(1), RetryDecision::GiveUp);
+    }
+
+    #[test]
+    fn the_constructor_and_the_struct_literal_agree() {
+        assert_eq!(
+            Backoff::exponential_with(MS(250), 1.5, Duration::from_secs(60), false),
+            Backoff::Exponential {
+                base: MS(250),
+                factor: 1.5,
+                max: Duration::from_secs(60),
+                jitter: false,
+            }
+        );
+        // The shorthand is the documented default curve.
+        assert_eq!(
+            Backoff::exponential(),
+            Backoff::exponential_with(Duration::from_secs(1), 2.0, Duration::from_secs(300), true)
+        );
+    }
+
+    #[test]
+    fn retry_decision_constructor_matches_what_decide_returns() {
+        let p = RetryPolicy::fixed(3, Duration::from_secs(2));
+        assert_eq!(p.decide(1), RetryDecision::retry(Duration::from_secs(2)));
+    }
+
+    /// The exact JSON a persisted policy has today. `Backoff` is
+    /// `Serialize`/`Deserialize`, so a policy can live in a config file or a
+    /// database, and 1.x must keep reading what 1.0 wrote. Any field added to
+    /// `Backoff::Exponential` later carries `#[serde(default)]`, which is what
+    /// keeps *this* document decoding; this test is the tripwire for that.
+    #[test]
+    fn todays_policy_json_round_trips_byte_for_byte() {
+        const JSON: &str = concat!(
+            r#"{"max_attempts":5,"backoff":{"Exponential":{"#,
+            r#""base":{"secs":1,"nanos":0},"factor":2.0,"#,
+            r#""max":{"secs":300,"nanos":0},"jitter":true}}}"#
+        );
+
+        let policy = RetryPolicy::exponential(5);
+        assert_eq!(serde_json::to_string(&policy).unwrap(), JSON);
+
+        let decoded: RetryPolicy = serde_json::from_str(JSON).unwrap();
+        assert_eq!(decoded, policy);
+
+        // The other two variants are part of the same document format.
+        for backoff in [Backoff::None, Backoff::Fixed(MS(500))] {
+            let policy = RetryPolicy::new(2, backoff);
+            let text = serde_json::to_string(&policy).unwrap();
+            assert_eq!(
+                serde_json::from_str::<RetryPolicy>(&text).unwrap(),
+                policy,
+                "{text}"
+            );
+        }
+        assert_eq!(serde_json::to_string(&Backoff::None).unwrap(), r#""None""#);
+        assert_eq!(
+            serde_json::to_string(&Backoff::Fixed(MS(500))).unwrap(),
+            r#"{"Fixed":{"secs":0,"nanos":500000000}}"#
+        );
     }
 
     #[test]

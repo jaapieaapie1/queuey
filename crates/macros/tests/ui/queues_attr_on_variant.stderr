@@ -1,0 +1,5 @@
+error: `#[queues(...)]` belongs on the enum; a variant takes `#[queue(...)]`
+ --> tests/ui/queues_attr_on_variant.rs:5:7
+  |
+5 |     #[queues(prefix = "myapp")]
+  |       ^^^^^^

@@ -5,9 +5,15 @@ RabbitMQ backend for [`queuey`](../..), built on [`lapin`](https://crates.io/cra
 `RabbitMqBackend` implements `queuey_core::Backend`:
 
 * one `lapin::Connection`;
-* one publishing channel in confirm mode, shared behind a `tokio::sync::Mutex`.
-  Every publish (enqueue, retry, defer, dead-letter) waits for the broker's
-  confirmation. Nothing is ever *declared* on it;
+* a small pool of publishing channels in confirm mode, at most
+  `RabbitMqOptions::publish_concurrency` (default 8) of them. Every publish
+  (enqueue, retry, defer, dead-letter) is `mandatory`, takes one channel of the
+  pool and holds it until the broker confirms. One publish per channel is the
+  point, not an implementation detail: `lapin` does not key a `basic.return` to
+  a delivery tag, so a channel with two publishes outstanding can hand the
+  return to the wrong one — the unroutable publish then reports success and the
+  delivery waiting on it acks an original whose successor went nowhere. Nothing
+  is ever *declared* on these channels;
 * one channel for the hold queue declarations every retry, delayed enqueue and
   `defer` makes on demand. A declaration is the one thing the broker routinely
   refuses (`PRECONDITION_FAILED` closes the channel it ran on), so it is kept
@@ -15,6 +21,40 @@ RabbitMQ backend for [`queuey`](../..), built on [`lapin`](https://crates.io/cra
 * one fresh channel per `consume` call, with `basic_qos(prefetch, global = false)`;
 * one throwaway channel per `declare`, so a rejected declaration cannot poison
   the other channels.
+
+## How much `lapin` this crate exposes
+
+None.
+
+`lapin` has gone 2 -> 3 -> 4 in short order, and a single `lapin` type in a public
+signature here would tie this crate's whole 1.x line to one of those majors: a `lapin`
+5.0 would be a `queuey` 2.0. So there is no `lapin` type in any public signature, public
+field, public re-export or public trait impl. `lapin` is an ordinary private dependency,
+and upgrading it is a patch release.
+
+Concretely, what is sealed and why:
+
+* the envelope <-> `BasicProperties` mapping (the former `codec` module) and the
+  `FieldTable` builders `topology::{queue_args, deferred_queue_args, dead_queue_args}`
+  are crate-private. They exist only to serve this backend's own publisher, and a
+  queue's declaration arguments are a pure function of its name anyway — there is
+  nothing useful to do with them from outside that would not risk a
+  `PRECONDITION_FAILED`;
+* there is no `pub use lapin`. Name `lapin` by depending on it;
+* there is no way to borrow the backend's connection or open a channel on it. An
+  application that also speaks raw AMQP opens its own connection;
+* `RabbitMqOptions` carries no `lapin::ConnectionProperties`. The one handshake detail
+  worth setting from out here is `connection_name`, a plain `String` (see
+  [Naming the connection](#naming-the-connection)).
+
+The parts of the topology an operator or a cleanup script genuinely needs are plain
+strings and stay public: `topology::{dead_queue_name, deferred_queue_name,
+deferred_ttl_ms}`, the `x-*` key constants and the `MAX_TTL_MS` / `MAX_DEFERRAL_MS`
+ceilings.
+
+`RabbitMqOptions`, `BackoffPolicy`, `Attempt` and `Rebuilding` are all
+`#[non_exhaustive]`: build the first two from `Default` plus their builders, the third
+from `Attempt::first` / `Attempt::after`, and match `Rebuilding` with a `_` arm.
 
 ## Reconnection
 
@@ -80,48 +120,34 @@ already had; an outage is when it stops being theoretical.
 Only the *first* connection is exempt: `connect` / `with_options` fail rather than retry,
 so a process that cannot reach its broker at startup says so instead of hanging.
 
-## Sharing the connection
+## Naming the connection
 
-`RabbitMqBackend::create_channel` opens a fresh `lapin::Channel` on the connection the
-backend is already maintaining, waiting for a reconnect first if that connection happens
-to be down.
-
-It reaches one vhost: the backend's, the one in the URI it was dialled with. Keeping
-application messaging on a *separate* vhost from your jobs is a good default and what this
-library assumes, because it walls job traffic, the dead-letter and hold queues below, and
-the permissions they need off from everything else. An application that does that needs
-its own connection for its own queues, which no method here can give it. This is for the
-other arrangement, where job queues and application queues deliberately share one vhost:
-consuming an ingress queue somebody else publishes to, publishing to a feedback queue
-somebody else reads. There a second connection to the same vhost buys nothing but another
-socket, another set of credentials, another reconnect loop and another thing to close.
+`RabbitMqOptions::connection_name` sets the name RabbitMQ shows for this backend's
+connection, in the management UI's connection list and in `rabbitmqctl list_connections
+client_properties`. It is the difference between an operator reading forty rows of
+`10.0.3.17:52344` and reading `orders-worker (eu-west-1, v1.4.2)`.
 
 ```rust
-use queuey_rabbitmq::RabbitMqBackend;
+use queuey_rabbitmq::{RabbitMqBackend, RabbitMqOptions};
 
-let backend = RabbitMqBackend::connect("amqp://guest:guest@localhost:5672/%2f").await?;
-
-let opened_on = backend.connection_generation();
-let channel = backend.create_channel().await?;
-// ... declare, publish and consume your own queues on `channel` ...
+let backend = RabbitMqBackend::with_options(
+    "amqp://guest:guest@localhost:5672/%2f",
+    RabbitMqOptions::default().connection_name("orders-worker"),
+)
+.await?;
 ```
 
-Two things come with it:
+It is sent during the handshake and re-sent on every reconnect, so the name survives an
+outage. It is purely descriptive: the broker never routes, authorises or deduplicates on
+it, and two processes may share one.
 
-* **The channel is yours, and it does not survive a reconnect.** The backend does not
-  track, reopen or close it. When the connection drops, the backend rebuilds *its*
-  channels, consumers and queue declarations on the replacement, but this channel is not
-  among them. It dies with the socket, and nothing tells its holder so.
-  `connection_generation()` is the signal: it starts at `1` and goes up by one per
-  successful reconnect, so a caller records it when it opens a channel and compares it
-  later. A different number means open a new channel and redo the declarations and
-  subscriptions that were on the old one.
-* **Do not collide with the topology below.** Declaring `q`, `q.dead` or
-  `q.deferred.{ttl_ms}` with arguments that differ from the ones the backend uses is
-  answered with `PRECONDITION_FAILED`, which closes the channel it ran on and, for a hold
-  queue, keeps failing every retry and deferral until somebody deletes the queue. Declare
-  only queues that are yours; `dead_queue_name` and `deferred_queue_name` say what the
-  backend's are called.
+This is the whole handshake surface, on purpose. It replaced a public
+`lapin::ConnectionProperties` field, which pinned this crate's major version to `lapin`'s
+in exchange for one setting anybody actually used. Arbitrary `client_properties`, the
+AMQP `locale` (RabbitMQ advertises only `en_US`, `lapin`'s default), a custom executor or
+reactor, and `lapin`'s own `enable_auto_recover` are all deliberately not configurable —
+the first two buy nothing, and the rest would either re-create the version pin or race
+with the reconnection above.
 
 ## Topology
 
@@ -271,6 +297,33 @@ All of these fail *before* anything is acked, so from `Delivery::retry` and
 `Delivery::defer` the original message stays unacknowledged and the broker
 redelivers it.
 
+## Publish concurrency
+
+`RabbitMqOptions::publish_concurrency` (default `8`) is how many publishes may be
+in flight at once, and therefore how many confirm-mode channels the backend
+keeps. A ninth concurrent publish waits for one of the eight to finish.
+
+It is bounded because a channel with more than one publish outstanding cannot
+tell whose `basic.return` is whose. `lapin` queues returned messages per channel
+and hands one to whichever pending delivery tag resolves first, which for a
+`basic.ack(multiple = true)` is arbitrary. Pipelining a single channel therefore
+lets an *unroutable* publish — a `q.dead` an operator deleted, a hold queue the
+broker expired — be reported as success, after which the delivery waiting on it
+acks an original that was never re-published anywhere. One publish per channel
+makes that impossible, and the pool is how the concurrency is bought back.
+
+Raise it when the confirm round trip rather than the handler is the bottleneck,
+which is the case for a publish-heavy process against a distant or `fsync`-bound
+broker: throughput is roughly `publish_concurrency / round_trip`, so a 10 ms
+round trip caps eight channels at about 800 publishes a second. Lower it only to
+spend fewer broker-side channels. `0` is clamped to `1`.
+
+```rust
+use queuey_rabbitmq::RabbitMqOptions;
+
+let options = RabbitMqOptions::default().publish_concurrency(32);
+```
+
 ## Upgrading
 
 **`q.retry` is gone.** Earlier versions declared a `q.retry` wait queue per work
@@ -314,7 +367,8 @@ broker-side migration. Existing hold queues expire on their own.
 
 Unit tests (topology naming, queue arguments including `x-max-priority` and the
 hold queue's TTL / `x-expires` arithmetic, property and header mapping, option
-defaults) need no broker and run with a plain:
+defaults) need no broker and run with a plain — the argument and property builders
+are crate-private, so those tests live beside them in `src/`:
 
 ```sh
 cargo test -p queuey-rabbitmq
@@ -331,3 +385,7 @@ AMQP_URL=amqp://guest:guest@localhost:5672/%2f cargo test -p queuey-rabbitmq
 
 Each test uses queue names carrying a fresh UUID and deletes them at the end
 (hold queues included), so runs can share a broker.
+
+## License
+
+MIT OR Apache-2.0. Both texts (`LICENSE-MIT`, `LICENSE-APACHE`) ship inside this crate.

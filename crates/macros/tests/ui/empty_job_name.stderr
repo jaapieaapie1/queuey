@@ -1,0 +1,5 @@
+error: `name` must not be empty
+  --> tests/ui/empty_job_name.rs:11:41
+   |
+11 | #[job(queue = AppQueues::Emails, name = "")]
+   |                                         ^^

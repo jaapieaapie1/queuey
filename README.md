@@ -257,14 +257,17 @@ delivery is settled, so a notification is never lost for a job that is already g
 at-least-once, like the rest of the system. It never changes the outcome: the job is dead-lettered
 either way, and a panicking hook is logged and stepped over.
 
-## Sharing the broker connection
+## Naming the broker connection
 
-`RabbitMqBackend::create_channel()` hands out a `lapin::Channel` on the backend's own connection, for
-an application whose own queues live on the same vhost as its jobs, where a second connection buys
-only another socket and another reconnect loop. Keep application messaging on its own vhost and it
-needs its own connection instead; a channel cannot cross vhosts. The channel is yours: it does not
-survive a reconnect (compare `connection_generation()` to notice), and it must not redeclare the
-library's own `q`, `q.dead` or `q.deferred.*`.
+`RabbitMqOptions::connection_name("orders-worker")` sets what RabbitMQ shows for this
+process in the management UI and in `rabbitmqctl list_connections`, which is the
+difference between an operator reading forty rows of `10.0.3.17:52344` and knowing which
+one to close. It is re-sent on every reconnect, so the name survives an outage.
+
+That is the entire handshake surface, and deliberately so: `queuey-rabbitmq` exposes no
+`lapin` type at all, because one in a public signature would make a `lapin` 5.0 into a
+`queuey` 2.0. An application that also speaks raw AMQP depends on `lapin` and opens its
+own connection.
 
 ## Workspace
 
@@ -297,12 +300,23 @@ cargo run -p queuey --example rabbitmq_end_to_end  # the same against a broker
   removed, and every addition carries `#[serde(default)]`. Bodies written by 0.2 and
   0.3 producers still decode.
 - **Public types are `#[non_exhaustive]`**, so a new field or variant is a minor
-  release. Build them with `QueueConfig::new`, `RetryPolicy::new`, `Envelope::new` and
-  the builders; `match` on the enums with a wildcard arm.
+  release. That includes the struct *variants* (`Backoff::Exponential`,
+  `RetryDecision::Retry`, `JobError::Deferred`), where the enum-level attribute alone
+  would not have stopped a downstream struct literal from breaking. Build them with
+  `QueueConfig::new`, `RetryPolicy::new`, `Envelope::new`, `Backoff::exponential_with`,
+  `JobError::deferred`, `JobContext::new`, `DeadLetter::new`, `RabbitMqOptions::default`
+  and the builders; `match` on the enums with a wildcard arm and on the struct variants
+  with a `..` rest.
+- **Your handlers and hooks are unit-testable.** `JobContext::new::<J>(attempt,
+  max_attempts)` and `DeadLetter::new(envelope, cause, reason)`, plus `with_*` builders
+  for the optional parts, build the two values a `JobHandler` and a `DeadLetterHook`
+  receive, so testing one is a function call rather than a backend and a worker.
 - **`Backend` and `Delivery` are implementable out of tree.** For the whole of 1.x they
   only gain methods that have a default implementation, so a backend written against
   1.0 keeps compiling.
 - **MSRV is 1.88, edition 2024.** A raise is a minor version bump, never a patch.
+- **Both licence texts ship inside every published crate**, not only at the repository
+  root, so the tarball crates.io serves satisfies the terms it declares.
 - The four crates share one version and are released together.
 
 Known limits, unchanged by 1.0: delivery is at-least-once (a job in flight when the
@@ -312,4 +326,5 @@ worker could not report); queues are classic, because deferral's overtake rides
 
 ## License
 
-MIT OR Apache-2.0
+MIT OR Apache-2.0. Both texts are at the repository root and inside every crate directory,
+since a published crate contains only its own directory.

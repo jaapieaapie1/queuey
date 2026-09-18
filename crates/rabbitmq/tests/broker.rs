@@ -814,6 +814,191 @@ async fn publishing_to_a_missing_queue_is_an_error() {
     cleanup(&control, &queue).await;
 }
 
+/// A `basic.return` must be reported against the publish that caused it, and
+/// against no other, however many publishes are in flight.
+///
+/// This is the guarantee `Ok(())` from a publish stands for — "durably handed
+/// over to a real queue" — and it is what makes it safe for
+/// [`Delivery::retry`](queuey_core::Delivery::retry), `defer` and `dead_letter`
+/// to ack the original afterwards. Break it in the direction this test catches
+/// and a job is acked away with nothing published in its place, silently.
+///
+/// The failure is not hypothetical. `lapin` does not key a returned message to
+/// a delivery tag: returns go onto one queue per channel and are handed to
+/// whichever pending tag the confirm handler resolves first, which for the
+/// `basic.ack(multiple = true)` RabbitMQ routinely sends is `HashMap` order.
+/// Share one confirm channel between publishes that are in flight together and
+/// the return lands on an arbitrary one of them, so the publish that was
+/// actually unroutable resolves as a bare ack and is reported as success.
+///
+/// # Why the rounds, and why these numbers
+///
+/// Misattribution is probabilistic, so a single round proves nothing. It needs
+/// the broker to coalesce the unroutable publish's confirm with an earlier one
+/// still in flight into one `basic.ack(multiple = true)`; `lapin` then hands
+/// the return to whichever of the covered tags its `HashMap` yields first.
+///
+/// The constants below were measured rather than guessed, against RabbitMQ 4
+/// on a local broker and a shared confirm channel:
+///
+/// * below about ten publishes in flight the confirms come back one at a time,
+///   in order, and attribution happens to be right almost always (500 rounds
+///   at two, three and five in flight: 0, 1 and 0 misattributions);
+/// * with the unroutable publish *first* it is also always right, because
+///   there is then no earlier pending tag for it to be stolen by (500 rounds:
+///   none either);
+/// * ten in flight with the unroutable one in the middle misattributes on
+///   roughly one round in fifteen (five runs of 500 rounds: 31, 33, 34, 37 and
+///   44).
+///
+/// Rounds are independent draws, so 300 of them expect around twenty
+/// misattributions and let a broken implementation pass with probability on
+/// the order of `e^-20`. The cost is 3000 small publishes, well under a second
+/// against a local broker.
+#[tokio::test]
+async fn a_return_is_attributed_to_the_publish_that_caused_it() {
+    let Some(url) = std::env::var("AMQP_URL").ok() else {
+        eprintln!("skipping: AMQP_URL not set");
+        return;
+    };
+
+    // Independent draws; see above.
+    const ROUNDS: u32 = 300;
+    // Publishes issued together per round, one of them unroutable.
+    const IN_FLIGHT: u32 = 10;
+    // Where the unroutable one sits. Not first: the return can only be stolen
+    // by a tag that was already pending when it arrived.
+    const UNROUTABLE: u32 = 5;
+
+    let queue = unique_queue("confirm-race");
+    // Never declared, so this one publish per round is unroutable and comes
+    // back as a `basic.return` while its neighbours are being confirmed.
+    let missing = unique_queue("confirm-race-missing");
+    let config = QueueConfig::new(queue.clone());
+    let backend = RabbitMqBackend::connect(&url).await.expect("connect");
+    let control = control(&url).await;
+    backend
+        .declare(std::slice::from_ref(&config))
+        .await
+        .expect("declare");
+    assert!(
+        !queue_exists(&control, &missing).await,
+        "`{missing}` must not exist for this test to mean anything"
+    );
+
+    for round in 0..ROUNDS {
+        let envelopes: Vec<Envelope> = (0..IN_FLIGHT)
+            .map(|slot| {
+                let target = if slot == UNROUTABLE { &missing } else { &queue };
+                envelope(target, round * IN_FLIGHT + slot)
+            })
+            .collect();
+
+        // Polled together, so every publish has written its frames before the
+        // first confirmation resolves. That overlap is what makes attribution
+        // a question at all.
+        let mut results: Vec<Result<(), Error>> =
+            futures::future::join_all(envelopes.iter().map(|sent| backend.publish(sent, None)))
+                .await;
+
+        // The unroutable one is checked first, deliberately: a stolen return
+        // shows up on both sides at once, and this is the side that loses jobs.
+        // Swapped out rather than removed so the slot numbers below stay honest.
+        let slot = usize::try_from(UNROUTABLE).expect("a slot index fits in a usize");
+        let unroutable = std::mem::replace(&mut results[slot], Ok(()));
+        let Err(error) = unroutable else {
+            panic!(
+                "round {round}: the publish to the missing queue `{missing}` was reported as \
+                 success, so a delivery would go on to ack an original whose successor went \
+                 nowhere"
+            );
+        };
+        let text = error.to_string();
+        assert!(
+            text.contains(&missing),
+            "round {round}: the return was reported against the wrong queue: {text}"
+        );
+        assert!(
+            text.contains("unroutable"),
+            "round {round}: the error did not explain the return: {text}"
+        );
+
+        for (slot, result) in results.into_iter().enumerate() {
+            if let Err(error) = result {
+                panic!(
+                    "round {round}, slot {slot}: a publish to the declared queue `{queue}` failed, \
+                     so it was handed the return that belongs to `{missing}`: {error}"
+                );
+            }
+        }
+    }
+
+    // Every routable publish really landed; none was lost along the way.
+    await_count(&control, &queue, ROUNDS * (IN_FLIGHT - 1)).await;
+
+    backend.close().await.expect("close");
+    cleanup(&control, &queue).await;
+    cleanup(&control, &missing).await;
+}
+
+/// `dead_letter` into a `q.dead` that is not there must fail, and must leave
+/// the original unacked for the broker to redeliver.
+///
+/// Publish-before-ack is the whole safety argument for dead-lettering, and
+/// nothing else in this suite exercises its failing half: `q.dead` is created
+/// by `declare` and is normally simply there. An operator deleting it, or a
+/// broker restart losing it, is exactly when the ordering has to hold.
+#[tokio::test]
+async fn dead_letter_into_a_missing_dead_queue_leaves_the_original_unacked() {
+    let Some(url) = std::env::var("AMQP_URL").ok() else {
+        eprintln!("skipping: AMQP_URL not set");
+        return;
+    };
+
+    let queue = unique_queue("dead-missing");
+    let config = QueueConfig::new(queue.clone());
+    let backend = RabbitMqBackend::connect(&url).await.expect("connect");
+    let control = control(&url).await;
+    backend
+        .declare(std::slice::from_ref(&config))
+        .await
+        .expect("declare");
+
+    // The queue this backend declared a moment ago, deleted out from under it.
+    let dead = backend.dead_queue_name(&queue);
+    delete_queues(&control, std::slice::from_ref(&dead)).await;
+    assert!(
+        !queue_exists(&control, &dead).await,
+        "`{dead}` should be gone"
+    );
+
+    backend
+        .publish(&envelope(&queue, 1), None)
+        .await
+        .expect("publish");
+    let mut stream = backend.consume(&config).await.expect("consume");
+    let delivery = next_delivery(&mut stream, Duration::from_secs(5)).await;
+
+    let error = delivery
+        .dead_letter("handler gave up")
+        .await
+        .expect_err("dead-lettering into a missing `q.dead` must fail");
+    let text = error.to_string();
+    assert!(text.contains(&dead), "error did not name `{dead}`: {text}");
+    assert!(
+        text.contains("unroutable"),
+        "error did not explain the return: {text}"
+    );
+
+    // Closing requeues whatever was left unacked, so the broker still owning
+    // the original is the proof that `dead_letter` did not ack it.
+    drop(stream);
+    backend.close().await.expect("close");
+    await_count(&control, &queue, 1).await;
+
+    cleanup(&control, &queue).await;
+}
+
 #[tokio::test]
 async fn dead_letter_rejects_when_dead_letter_queues_are_disabled() {
     let Some(url) = std::env::var("AMQP_URL").ok() else {
@@ -1488,77 +1673,6 @@ async fn deferral_past_the_cap_is_refused() {
     delete_queues(&control, &[hold]).await;
 }
 
-#[tokio::test]
-async fn a_borrowed_channel_works_an_application_queue_on_the_same_connection() {
-    let Some(url) = std::env::var("AMQP_URL").ok() else {
-        eprintln!("skipping: AMQP_URL not set");
-        return;
-    };
-
-    let queue = unique_queue("borrowed-jobs");
-    // Not part of the library's topology: no suffix it knows, nothing declared
-    // through `Backend::declare`. This is the queue an application shares with
-    // some other system.
-    let app = unique_queue("borrowed-app");
-    let config = QueueConfig::new(queue.clone());
-    let backend = RabbitMqBackend::connect(&url).await.expect("connect");
-    let control = control(&url).await;
-    backend
-        .declare(std::slice::from_ref(&config))
-        .await
-        .expect("declare");
-
-    let opened_on = backend.connection_generation();
-    let channel = backend.create_channel().await.expect("create_channel");
-
-    // Declaring on the borrowed channel is the caller's own business: the
-    // backend neither knows about this queue nor deletes it.
-    channel
-        .queue_declare(
-            app.as_str().into(),
-            QueueDeclareOptions::default(),
-            FieldTable::default(),
-        )
-        .await
-        .expect("declare the application queue");
-
-    let body: &[u8] = b"not an envelope, and nothing here should care";
-    publish_raw(&channel, &app, body).await;
-    assert_eq!(ready_count(&control, &app).await, 1);
-
-    let message = channel
-        .basic_get(app.as_str().into(), BasicGetOptions { no_ack: true })
-        .await
-        .expect("basic_get")
-        .expect("the message published on the borrowed channel")
-        .delivery;
-    assert_eq!(message.data.as_slice(), body, "the body came back verbatim");
-
-    // The backend's own channels are untouched by any of that, in particular by
-    // the `confirm_select` the raw publish put on the borrowed channel.
-    backend
-        .publish(&envelope(&queue, 1), None)
-        .await
-        .expect("the backend still publishes on its own channel");
-    await_count(&control, &queue, 1).await;
-
-    // No reconnect happened, so the borrowed channel is still the one that was
-    // handed out: the generation a caller would compare against has not moved.
-    assert_eq!(
-        backend.connection_generation(),
-        opened_on,
-        "the connection was never replaced during this exchange"
-    );
-    assert!(channel.status().connected(), "the borrowed channel is live");
-
-    // Closing it is the caller's job; the backend would not do it.
-    channel.close(200, "OK".into()).await.expect("close");
-
-    backend.close().await.expect("close");
-    cleanup(&control, &queue).await;
-    delete_queues(&control, &[app]).await;
-}
-
 // ---------------------------------------------------------------------------
 // reconnection
 // ---------------------------------------------------------------------------
@@ -1671,12 +1785,24 @@ async fn await_disconnected(backend: &RabbitMqBackend) {
     panic!("the backend never noticed its connection was cut");
 }
 
+/// A dropped connection is a pause for publishers, not an error — for every
+/// channel of the confirm pool, not just the one that happened to be used
+/// first.
+///
+/// The bursts are what make that second half true. Publishes are spread over a
+/// pool of confirm channels (one publish each, so a `basic.return` can be
+/// attributed), and a connection drop closes all of them at once. A burst
+/// before the cut opens more than one, and a burst after it proves each is
+/// replaced on the new connection rather than handed out dead.
 #[tokio::test]
 async fn publishing_reconnects_after_the_connection_drops() {
     let Some(url) = std::env::var("AMQP_URL").ok() else {
         eprintln!("skipping: AMQP_URL not set");
         return;
     };
+
+    // Enough concurrent publishes to fill the default confirm pool.
+    const BURST: u32 = 8;
 
     let proxy = BrokerProxy::start(upstream_addr(&url)).await;
     let queue = unique_queue("reconnect-publish");
@@ -1691,22 +1817,27 @@ async fn publishing_reconnects_after_the_connection_drops() {
         .declare(std::slice::from_ref(&config))
         .await
         .expect("declare");
-    backend
-        .publish(&envelope(&queue, 1), None)
-        .await
-        .expect("publish before the cut");
-    await_count(&control, &queue, 1).await;
+
+    let before: Vec<Envelope> = (0..BURST).map(|n| envelope(&queue, n)).collect();
+    for result in
+        futures::future::join_all(before.iter().map(|sent| backend.publish(sent, None))).await
+    {
+        result.expect("publish before the cut");
+    }
+    await_count(&control, &queue, BURST).await;
 
     proxy.cut();
     await_disconnected(&backend).await;
 
-    // The publish is what notices the connection is gone: it must wait for a
-    // replacement rather than fail.
-    backend
-        .publish(&envelope(&queue, 2), None)
-        .await
-        .expect("publish after the cut must reconnect, not fail");
-    await_count(&control, &queue, 2).await;
+    // The publishes are what notice the connection is gone: they must wait for
+    // a replacement rather than fail, and every pooled channel must come back.
+    let after: Vec<Envelope> = (BURST..2 * BURST).map(|n| envelope(&queue, n)).collect();
+    for result in
+        futures::future::join_all(after.iter().map(|sent| backend.publish(sent, None))).await
+    {
+        result.expect("publish after the cut must reconnect, not fail");
+    }
+    await_count(&control, &queue, 2 * BURST).await;
     assert!(
         backend.is_connected(),
         "the backend is back on a connection"

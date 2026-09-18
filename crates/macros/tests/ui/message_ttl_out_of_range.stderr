@@ -1,0 +1,5 @@
+error: `message_ttl` must be between "1ms" and "4294967295ms" (~49.7 days): a broker stores it as an unsigned 32-bit millisecond count, so a longer TTL cannot be expressed and would be silently clamped
+ --> tests/ui/message_ttl_out_of_range.rs:7:27
+  |
+7 |     #[queue(message_ttl = "100d")]
+  |                           ^^^^^^

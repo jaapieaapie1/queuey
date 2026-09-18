@@ -120,6 +120,9 @@ Container attribute `#[queues(...)]`, optional:
 | `prefix = "myapp"` | queue names become `"myapp.<name>"` |
 | `crate = "path"` | where generated code finds the core crate; normally unnecessary, see below |
 
+The `.` between the prefix and the name is added for you, so a `prefix` that already ends
+in one (`"myapp."`) is a compile error rather than a queue called `myapp..emails`.
+
 Variant attribute `#[queue(...)]`, optional on every variant:
 
 | key | default | meaning |
@@ -127,13 +130,16 @@ Variant attribute `#[queue(...)]`, optional on every variant:
 | `name = "img"` | `snake_case` of the variant | the queue's name, before the prefix |
 | `prefetch = 10` | `16` | unacknowledged messages per consumer, `1..=65535` |
 | `durable = true` | `true` | whether the queue survives a broker restart |
-| `message_ttl = "30s"` | none | per-message TTL applied on publish |
+| `message_ttl = "30s"` | none | per-message TTL applied on publish; at most `"4294967295ms"` (~49.7 days) |
 | `max_priority = 10` | `10` | priority levels the queue is declared with; `0` turns priorities off |
 | `retry(...)` | no retries | default retry policy for jobs on this queue |
 
-Every mistake is a compile error pointing at the offending token: an empty name, a
-duplicate resolved name, `prefetch = 0` (unlimited in AMQP, so omit the key instead),
-a zero duration, `base` greater than `max`, an unknown key.
+Every mistake is a compile error pointing at the offending token: a name that is empty or
+only whitespace, a duplicate resolved name, a `prefix` ending in `.`, `prefetch = 0`
+(unlimited in AMQP, so omit the key instead), a zero duration, a `message_ttl` past what a
+broker's 32-bit millisecond `x-message-ttl` can hold, `base` greater than `max`, an unknown
+key — and `#[queue(...)]` written on the enum or `#[queues(...)]` on a variant, which the
+compiler would otherwise accept and ignore.
 
 ## Declaring jobs
 
@@ -148,7 +154,7 @@ struct SendEmail { to: String, body: String }
 | key | default | meaning |
 |---|---|---|
 | `queue = AppQueues::Emails` | required | the variant this job lives on; everything before the last segment is the queue set type |
-| `name = "emails.send"` | `module_path!() + "::" + type name` | the job type name carried in every envelope and used to route to a handler |
+| `name = "emails.send"` | `module_path!() + "::" + type name` | the job type name carried in every envelope and used to route to a handler; must not be empty or only whitespace |
 | `retry(...)` | inherit from the queue | retry policy override for this job type |
 | `crate = "path"` | auto | same as on `#[queues]` |
 
@@ -175,8 +181,9 @@ Precedence when a job fails: the job's own `retry(...)` wins over the queue's, a
 without either the job is dead-lettered on its first failure.
 
 Durations are string literals parsed at compile time: an integer followed by `ms`,
-`s`, `m`, `h` or `d`. A bare integer means seconds. `"500ms"`, `"30s"`, `"2 m"` and
-`"30"` are all valid. Zero is rejected everywhere a duration is accepted.
+`s`, `m`, `h` or `d`. A bare integer means seconds. `"500ms"`, `"30s"`, `"2 m"`, `"7d"` and
+`"30"` are all valid. Zero is rejected everywhere a duration is accepted, and `message_ttl`
+is additionally capped at `"4294967295ms"`, the largest `x-message-ttl` a broker can store.
 
 ## Handlers
 
@@ -478,12 +485,22 @@ succeeds. Then it shuts the worker down gracefully and prints what the backend s
 ## How the derive macros find this crate
 
 Generated code needs a path to `queuey-core`. The macros read the calling crate's
-`Cargo.toml` and prefer a dependency on `queuey`, emitting `::queuey::__core`, a hidden
-re-export of the core crate. Renamed dependencies are handled. So a crate depending on
-this facade alone needs no `crate = "..."` attribute. A crate that depends on
-`queuey-core` directly gets `::queuey_core` instead. For anything else, a vendored copy
-or a re-export under yet another name, `#[queues(crate = "...")]` and
-`#[job(crate = "...")]` always win.
+`Cargo.toml`. A crate that names `queuey-core` there gets `::queuey_core`; a crate that
+names only this facade gets `::queuey::__core`, a hidden re-export of the core crate.
+Renamed dependencies are handled, so one dependency and no `crate = "..."` attribute is
+enough either way.
+
+The core crate is tried first on purpose. A manifest is not a build graph: it does not say
+which target is compiling, and `[dev-dependencies]` are read along with `[dependencies]`. A
+crate that depends on `queuey-core` and keeps this facade for its tests only would otherwise
+be handed `::queuey::__core` in its own lib, where the facade is not linked. `::queuey_core`
+is correct in that manifest and in every other one, because this facade only re-exports the
+core crate.
+
+If neither crate is in the manifest, the derives say so rather than emitting a path rustc
+can only complain about, and point at the escape hatch: `#[queues(crate = "...")]` and
+`#[job(crate = "...")]` name the core crate explicitly, never read the manifest, and always
+win. Use them for a vendored copy or a re-export under yet another name.
 
 ## Workspace
 
@@ -506,4 +523,4 @@ Rust 1.88, edition 2024. `#![forbid(unsafe_code)]`.
 
 ## License
 
-MIT OR Apache-2.0
+MIT OR Apache-2.0. Both texts (`LICENSE-MIT`, `LICENSE-APACHE`) ship inside this crate.

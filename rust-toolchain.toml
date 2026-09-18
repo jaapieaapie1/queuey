@@ -1,2 +1,4 @@
 [toolchain]
 channel = "stable"
+# So a fresh clone reproduces CI without installing these by hand.
+components = ["clippy", "rustfmt"]

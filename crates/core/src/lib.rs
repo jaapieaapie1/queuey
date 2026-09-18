@@ -23,6 +23,7 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(unreachable_pub)]
 
 pub mod backend;
 pub mod dead_letter;

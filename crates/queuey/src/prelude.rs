@@ -9,8 +9,18 @@
 //! [`DeadLetterCause`], [`FnDeadLetterHook`]), [`MemoryBackend`] with [`AckKind`],
 //! [`DEFAULT_MAX_PRIORITY`], and the three third-party
 //! items that user code cannot avoid naming: [`macro@async_trait`],
-//! [`Serialize`]/[`Deserialize`] and [`Arc`]. With the default `rabbitmq` feature
-//! it also re-exports [`RabbitMqBackend`].
+//! [`Serialize`]/[`Deserialize`] and [`Arc`].
+//!
+// The link only resolves when the re-export below exists, and a broken
+// intra-doc link is a warning, which this workspace treats as an error.
+#![cfg_attr(
+    feature = "rabbitmq",
+    doc = "With the default `rabbitmq` feature it also re-exports [`RabbitMqBackend`]."
+)]
+#![cfg_attr(
+    not(feature = "rabbitmq"),
+    doc = "The default `rabbitmq` feature, which would also re-export `RabbitMqBackend`, is off in this build."
+)]
 //!
 //! Deriving [`Serialize`]/[`Deserialize`] through this prelude still requires
 //! `serde` in the calling crate's `Cargo.toml`: the derive expands to code that

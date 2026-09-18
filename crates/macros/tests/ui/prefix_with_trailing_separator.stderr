@@ -1,0 +1,5 @@
+error: `prefix` must not end with `.`: the separator before the queue name is added for you, so `prefix = "myapp"` already yields `myapp.emails`
+ --> tests/ui/prefix_with_trailing_separator.rs:5:19
+  |
+5 | #[queues(prefix = "myapp.")]
+  |                   ^^^^^^^^

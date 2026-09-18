@@ -5,9 +5,29 @@
 //! [`WorkerBuilder::handler`] are checked at compile time. A job belonging to
 //! another application's queue set does not compile.
 //!
-//! This crate is a facade: it re-exports [`queuey_core`], the derive
-//! macros from `queuey-macros`, and (behind the default `rabbitmq`
-//! feature) [`queuey_rabbitmq`]. Depending on it alone is enough.
+//! This crate is a facade: it re-exports [`queuey_core`], the derive macros from
+//! `queuey-macros`, and, behind the default `rabbitmq` feature, the RabbitMQ
+//! backend. Depending on it alone is enough.
+//!
+//! The quickstart below is the same program whichever backend you pick, because
+//! everything above the backend line is transport-agnostic. With the default
+//! features it connects to a broker; with `default-features = false` there is no
+//! `lapin` in the dependency tree and it runs in process on [`MemoryBackend`],
+//! which is also what tests and the `memory_quickstart` example use.
+//!
+#![cfg_attr(
+    feature = "rabbitmq",
+    doc = "See [`queuey_rabbitmq`] for the topology it declares, its options and how it"
+)]
+#![cfg_attr(feature = "rabbitmq", doc = "recovers a dropped connection.")]
+#![cfg_attr(
+    not(feature = "rabbitmq"),
+    doc = "Turn the `rabbitmq` feature back on to get `RabbitMqBackend`, which is what"
+)]
+#![cfg_attr(
+    not(feature = "rabbitmq"),
+    doc = "swaps in on the backend line below; nothing else in the program changes."
+)]
 //!
 //! ```no_run
 //! use queuey::prelude::*;
@@ -38,7 +58,17 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> queuey::Result<()> {
-//!     let backend = Arc::new(RabbitMqBackend::connect("amqp://guest:guest@localhost:5672/%2f").await?);
+// The one line that depends on the feature. Written as two `cfg_attr`s rather
+// than two whole examples so the quickstart a newcomer reads stays a single
+// program, and so the `rabbitmq`-off build cannot drift out of step with it.
+#![cfg_attr(
+    feature = "rabbitmq",
+    doc = "    let backend = Arc::new(RabbitMqBackend::connect(\"amqp://guest:guest@localhost:5672/%2f\").await?);"
+)]
+#![cfg_attr(
+    not(feature = "rabbitmq"),
+    doc = "    let backend = Arc::new(MemoryBackend::new());"
+)]
 //!
 //!     let producer = Producer::<AppQueues, _>::new(backend.clone()).await?;
 //!     producer.enqueue(&SendEmail { to: "a@b.c".into(), body: "hi".into() }).await?;
@@ -142,15 +172,27 @@
 //!
 //! # How the derive macros find this crate
 //!
-//! Generated code needs a path to `queuey-core`. The macros read the
-//! *calling* crate's `Cargo.toml` and prefer a dependency on `queuey`,
-//! emitting `::queuey::__core`, a hidden re-export of the core crate.
-//! Depending only on this facade therefore needs no `crate = "..."` attribute.
-//! A crate that depends on `queuey-core` directly gets
-//! `::queuey_core` instead.
+//! Generated code needs a path to `queuey-core`. The macros read the *calling*
+//! crate's `Cargo.toml`. A crate that names `queuey-core` there gets
+//! `::queuey_core`; a crate that names only this facade gets `::queuey::__core`,
+//! a hidden re-export of the core crate. Either way, depending on one crate is
+//! enough and no `crate = "..."` attribute is needed.
+//!
+//! The core crate is looked up first on purpose. A manifest is not a build
+//! graph: `Cargo.toml` says nothing about which target is being compiled, so a
+//! crate that keeps `queuey-core` in `[dependencies]` and this facade in
+//! `[dev-dependencies]` (or as an `optional` dependency whose feature is off)
+//! would otherwise be handed `::queuey::__core` for its own lib, where the
+//! facade is not linked. `::queuey_core` is safe in that situation and in every
+//! other one, because this facade only re-exports the core crate.
+//!
+//! If neither crate is in the manifest, the derives say so and point at
+//! `#[queues(crate = "...")]` / `#[job(crate = "...")]`, which names the core
+//! crate explicitly and always wins.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(unreachable_pub)]
 
 // Makes `::queuey::__core` (what the derives emit) resolve inside this
 // crate itself, so the macros work in its own doctests and examples.

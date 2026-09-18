@@ -62,6 +62,49 @@ pub struct DeadLetter {
 }
 
 impl DeadLetter {
+    /// A report that `envelope` was given up on, for `cause`, with `reason`.
+    ///
+    /// The worker builds these; this exists so a [`DeadLetterHook`] can be
+    /// unit-tested for what it is actually for — deciding what to alert on,
+    /// what to write back to the system that enqueued the job — without
+    /// standing up a backend, a worker and a job that fails on purpose just to
+    /// produce one value. The type is `#[non_exhaustive]`, so a struct literal
+    /// is not an option downstream.
+    ///
+    /// `max_attempts` starts as [`None`], which is the truthful default: it is
+    /// what the worker reports for [`DeadLetterCause::NoHandler`], where no
+    /// policy could be resolved. Set it with
+    /// [`with_max_attempts`](Self::with_max_attempts) for the causes that had
+    /// one.
+    ///
+    /// ```
+    /// use queuey_core::{DeadLetter, DeadLetterCause, Envelope};
+    ///
+    /// let envelope = Envelope::raw("SendEmail", "emails", serde_json::json!({}));
+    /// let dead = DeadLetter::new(envelope, DeadLetterCause::Exhausted, "smtp timeout")
+    ///     .with_max_attempts(Some(3));
+    ///
+    /// assert!(dead.cause.reached_handler());
+    /// assert_eq!(dead.attempts(), 1);
+    /// ```
+    #[must_use]
+    pub fn new(envelope: Envelope, cause: DeadLetterCause, reason: impl Into<String>) -> Self {
+        Self {
+            envelope,
+            cause,
+            reason: reason.into(),
+            max_attempts: None,
+        }
+    }
+
+    /// Set the effective policy's `max_attempts`, or [`None`] when there was no
+    /// policy to resolve.
+    #[must_use]
+    pub fn with_max_attempts(mut self, max_attempts: Option<u32>) -> Self {
+        self.max_attempts = max_attempts;
+        self
+    }
+
     /// Attempts this job made, including the one that just failed.
     #[must_use]
     pub fn attempts(&self) -> u32 {
@@ -131,11 +174,68 @@ where
 mod tests {
     use super::*;
 
+    use std::sync::{Arc, Mutex};
+
     #[test]
     fn only_handler_causes_report_a_job_failure() {
         assert!(DeadLetterCause::Fatal.reached_handler());
         assert!(DeadLetterCause::Exhausted.reached_handler());
         assert!(!DeadLetterCause::NoHandler.reached_handler());
         assert!(!DeadLetterCause::Decode.reached_handler());
+    }
+
+    fn envelope() -> Envelope {
+        Envelope::raw(
+            "test::Greet",
+            "test.alpha",
+            serde_json::json!({"name": "x"}),
+        )
+    }
+
+    #[test]
+    fn the_constructor_defaults_max_attempts_to_none_and_the_builder_sets_it() {
+        let dead = DeadLetter::new(envelope(), DeadLetterCause::NoHandler, "no handler");
+        assert_eq!(dead.max_attempts, None, "there was no policy to resolve");
+        assert_eq!(dead.reason, "no handler");
+        assert_eq!(dead.attempts(), 1);
+
+        let dead = DeadLetter::new(envelope(), DeadLetterCause::Exhausted, "boom")
+            .with_max_attempts(Some(3));
+        assert_eq!(dead.max_attempts, Some(3));
+    }
+
+    /// The reason [`DeadLetter::new`] exists: a hook's own logic — which causes
+    /// it escalates, what it writes back — is testable by calling it, with no
+    /// backend, no worker and no job engineered to fail.
+    #[tokio::test]
+    async fn a_hook_is_testable_without_a_worker() {
+        let escalated = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&escalated);
+        let hook = FnDeadLetterHook::new(move |dead: DeadLetter| {
+            let sink = Arc::clone(&sink);
+            async move {
+                if dead.cause.reached_handler() {
+                    sink.lock().expect("not poisoned").push(dead.reason);
+                }
+            }
+        });
+
+        hook.on_dead_letter(DeadLetter::new(
+            envelope(),
+            DeadLetterCause::Decode,
+            "bad payload",
+        ))
+        .await;
+        hook.on_dead_letter(
+            DeadLetter::new(envelope(), DeadLetterCause::Fatal, "endpoint gone")
+                .with_max_attempts(Some(5)),
+        )
+        .await;
+
+        assert_eq!(
+            *escalated.lock().expect("not poisoned"),
+            vec!["endpoint gone".to_owned()],
+            "only the causes that reached user code are escalated"
+        );
     }
 }

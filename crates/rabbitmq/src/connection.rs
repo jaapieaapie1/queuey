@@ -101,7 +101,7 @@ impl ConnectionHandle {
     /// loop while whoever called `connect().await` waits. Reconnection covers
     /// the connections after this one, which nobody is awaiting.
     pub(crate) async fn connect(uri: &str, options: Arc<RabbitMqOptions>) -> Result<Arc<Self>> {
-        let connection = Connection::connect(uri, options.connection_properties.clone())
+        let connection = Connection::connect(uri, options.handshake_properties())
             .await
             .map_err(amqp)?;
 
@@ -250,7 +250,7 @@ impl ConnectionHandle {
             }
             self.check_open()?;
 
-            match Connection::connect(&self.uri, self.options.connection_properties.clone()).await {
+            match Connection::connect(&self.uri, self.options.handshake_properties()).await {
                 Ok(connection) => {
                     let connection = Arc::new(connection);
                     // The handle may have been closed while we were dialling.

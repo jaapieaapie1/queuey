@@ -13,6 +13,14 @@ use crate::{
 /// [`RabbitMqOptions::deferred_granularity`].
 const DEFAULT_GRANULARITY: Duration = Duration::from_secs(1);
 
+/// Default for [`RabbitMqOptions::publish_concurrency`].
+///
+/// One confirm-mode channel per concurrent publish, so this is both the number
+/// of channels the backend may open for publishing and the number of publisher
+/// confirms it may have outstanding. See the field's docs for why it is a
+/// ceiling and when to move it.
+const DEFAULT_PUBLISH_CONCURRENCY: usize = 8;
+
 /// Configuration for [`RabbitMqBackend::with_options`](crate::RabbitMqBackend::with_options).
 ///
 /// ```
@@ -23,10 +31,65 @@ const DEFAULT_GRANULARITY: Duration = Duration::from_secs(1);
 ///     .declare_dead_letter_queues(false);
 /// assert_eq!(options.dead_suffix, "-dlq");
 /// ```
+///
+/// Non-exhaustive, and deliberately so: this is where a new tunable lands, and
+/// the alternative is that the first bound worth exposing (a publisher-confirm
+/// timeout, a dial timeout) costs a major version. Start from
+/// [`RabbitMqOptions::default`] and chain the builders below; the fields stay
+/// public, so reading one needs nothing extra.
+///
+/// # No raw `lapin` handshake properties
+///
+/// Earlier versions had a `connection_properties: lapin::ConnectionProperties`
+/// field here. It is gone, and nothing takes its place wholesale: a `lapin` type
+/// in a public signature pins this crate's entire 1.x line to one `lapin` major,
+/// so a `lapin` 5.0 would have forced a `queuey` 2.0 for a field almost nobody
+/// set. The one thing people actually reached for it — naming the connection so
+/// an operator can tell it apart in the management UI — is
+/// [`connection_name`](Self::connection_name), a plain [`String`] this crate
+/// owns.
+///
+/// What is deliberately *not* configurable, rather than merely unimplemented:
+///
+/// * **Arbitrary `client_properties`.** Beyond the connection name they are
+///   decoration the broker only ever shows back to you, and exposing a
+///   key/value bag typed in `lapin`'s `ShortString`/`LongString` would re-create
+///   the pin this removal exists to break.
+/// * **The AMQP `locale`.** RabbitMQ advertises exactly one, `en_US`, which is
+///   `lapin`'s default; a knob whose only valid value is the default is a
+///   support question waiting to happen.
+/// * **A custom executor, reactor or auth provider.** Each is a `lapin` trait
+///   object, so exposing one would pin the major version outright, and this
+///   backend is built for the `tokio` runtime the rest of `queuey` already
+///   requires.
+/// * **`lapin`'s own `enable_auto_recover`.** Reconnection is this crate's job
+///   and is governed by [`reconnect`](Self::reconnect); two recovery mechanisms
+///   racing on one connection is worse than either alone.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct RabbitMqOptions {
-    /// Handshake properties passed to `lapin::Connection::connect`.
-    pub connection_properties: ConnectionProperties,
+    /// Name reported to the broker for this backend's connection, or [`None`]
+    /// for none.
+    ///
+    /// Defaults to [`None`]. Set it and RabbitMQ shows it in the management UI's
+    /// connection list and in `rabbitmqctl list_connections client_properties`,
+    /// which is the difference between an operator reading forty rows of
+    /// `10.0.3.17:52344` and reading `orders-worker (eu-west-1, v1.4.2)`. It is
+    /// sent once, during the handshake, and re-sent on every reconnect, so the
+    /// name survives an outage.
+    ///
+    /// Purely descriptive: the broker never routes, authorises or deduplicates
+    /// on it, and nothing stops two processes using the same one. Include
+    /// whatever *you* would want to see at 3am — the role, the region, the
+    /// version, the pod.
+    ///
+    /// ```
+    /// use queuey_rabbitmq::RabbitMqOptions;
+    ///
+    /// let options = RabbitMqOptions::default().connection_name("orders-worker");
+    /// assert_eq!(options.connection_name.as_deref(), Some("orders-worker"));
+    /// ```
+    pub connection_name: Option<String>,
 
     /// Suffix appended to a queue name to name its dead-letter queue.
     ///
@@ -117,6 +180,44 @@ pub struct RabbitMqOptions {
     /// queue a delay lands in, never that queue's arguments.
     pub deferred_granularity: Duration,
 
+    /// How many publishes may be in flight at once, and therefore how many
+    /// confirm-mode channels the backend keeps.
+    ///
+    /// Defaults to `8`. Every publish — an enqueue, a retry, a deferral, a
+    /// dead-letter — takes one channel of a pool this size and holds it until
+    /// the broker confirms, so this is the ceiling on publisher confirms
+    /// outstanding at any moment. A ninth concurrent publish waits for one of
+    /// the eight to finish.
+    ///
+    /// # Why it is a ceiling at all
+    ///
+    /// Because a channel with more than one publish outstanding cannot tell
+    /// whose `basic.return` is whose. `lapin` queues returned messages per
+    /// channel and hands one to whichever pending delivery tag resolves first,
+    /// which for the `basic.ack(multiple = true)` RabbitMQ routinely sends is
+    /// arbitrary. Pipelining a single channel therefore lets an *unroutable*
+    /// publish (a `q.dead` an operator deleted, a hold queue the broker
+    /// expired) be reported as success, after which the delivery that was
+    /// waiting on it acks an original whose successor went nowhere. One publish
+    /// per channel makes that impossible, and this is how the concurrency
+    /// pipelining used to provide is bought back.
+    ///
+    /// # Picking a number
+    ///
+    /// Eight is chosen to cover the common shape — a worker settling a handful
+    /// of jobs while a producer enqueues — without turning one backend into a
+    /// channel hog. Raise it when the *confirm round trip* rather than the
+    /// handler is the bottleneck, which is the case for a publish-heavy process
+    /// against a distant or `fsync`-bound broker: throughput is roughly
+    /// `publish_concurrency / round_trip`, so a 10 ms round trip caps eight
+    /// channels at ~800 publishes a second. Lower it only to spend fewer
+    /// broker-side channels; below that the setting buys nothing.
+    ///
+    /// `0` is clamped to `1` rather than rejected, because a builder must not
+    /// panic on a configuration value and "no publishing at all" is not a thing
+    /// anyone meant.
+    pub publish_concurrency: usize,
+
     /// How a lost connection is recovered, or [`None`] to fail instead.
     ///
     /// Defaults to [`BackoffPolicy::default`](crate::BackoffPolicy): retry
@@ -153,23 +254,42 @@ pub struct RabbitMqOptions {
 impl Default for RabbitMqOptions {
     fn default() -> Self {
         Self {
-            connection_properties: ConnectionProperties::default(),
+            connection_name: None,
             dead_suffix: DEFAULT_DEAD_SUFFIX.to_owned(),
             declare_dead_letter_queues: true,
             deferred_suffix: DEFAULT_DEFERRED_SUFFIX.to_owned(),
             retry_granularity: DEFAULT_GRANULARITY,
             deferred_granularity: DEFAULT_GRANULARITY,
+            publish_concurrency: DEFAULT_PUBLISH_CONCURRENCY,
             reconnect: Some(default_policy()),
         }
     }
 }
 
 impl RabbitMqOptions {
-    /// Replace the connection handshake properties.
+    /// Name this backend's connection for the broker's benefit.
+    ///
+    /// See [`connection_name`](Self::connection_name) for what it buys and what
+    /// it does not.
     #[must_use]
-    pub fn connection_properties(mut self, properties: ConnectionProperties) -> Self {
-        self.connection_properties = properties;
+    pub fn connection_name(mut self, name: impl Into<String>) -> Self {
+        self.connection_name = Some(name.into());
         self
+    }
+
+    /// The handshake properties this configuration asks `lapin` for.
+    ///
+    /// Crate-private: it returns a `lapin` type, and keeping the translation on
+    /// this side of the wall is the whole point of owning
+    /// [`connection_name`](Self::connection_name) as a [`String`]. Called on
+    /// every dial, the first one and every reconnect, so a named connection
+    /// keeps its name across an outage.
+    pub(crate) fn handshake_properties(&self) -> ConnectionProperties {
+        let properties = ConnectionProperties::default();
+        match &self.connection_name {
+            Some(name) => properties.with_connection_name(name.as_str().into()),
+            None => properties,
+        }
     }
 
     /// Replace the dead-letter queue suffix.
@@ -212,6 +332,25 @@ impl RabbitMqOptions {
     #[must_use]
     pub fn deferred_granularity(mut self, granularity: Duration) -> Self {
         self.deferred_granularity = granularity;
+        self
+    }
+
+    /// Replace the number of publishes that may be in flight at once.
+    ///
+    /// One confirm-mode channel is kept per unit, so this trades broker-side
+    /// channels for publish throughput. See
+    /// [`publish_concurrency`](Self::publish_concurrency) for why it is
+    /// bounded at all and how to choose. `0` is clamped to `1`.
+    ///
+    /// ```
+    /// use queuey_rabbitmq::RabbitMqOptions;
+    ///
+    /// let wide = RabbitMqOptions::default().publish_concurrency(32);
+    /// assert_eq!(wide.publish_concurrency, 32);
+    /// ```
+    #[must_use]
+    pub fn publish_concurrency(mut self, publishes: usize) -> Self {
+        self.publish_concurrency = publishes;
         self
     }
 
@@ -286,6 +425,10 @@ mod tests {
         assert_eq!(options.deferred_suffix, ".deferred");
         assert_eq!(options.retry_granularity, Duration::from_secs(1));
         assert_eq!(options.deferred_granularity, Duration::from_secs(1));
+        assert_eq!(
+            options.publish_concurrency, 8,
+            "publishes pipeline eight deep by default, one confirm channel each"
+        );
         assert!(
             options.reconnect.is_some(),
             "a dropped connection is recovered by default"
@@ -388,9 +531,44 @@ mod tests {
     }
 
     #[test]
-    fn connection_properties_can_be_replaced() {
-        let options = RabbitMqOptions::default()
-            .connection_properties(ConnectionProperties::default().with_locale("nl_NL".into()));
-        assert!(format!("{:?}", options.connection_properties).contains("nl_NL"));
+    fn the_connection_is_anonymous_until_it_is_named() {
+        // No name is the default, and then nothing is added to the handshake:
+        // an unset option must not put an empty `connection_name` in front of an
+        // operator reading the management UI.
+        let options = RabbitMqOptions::default();
+        assert_eq!(options.connection_name, None);
+        assert_eq!(
+            format!("{:?}", options.handshake_properties()),
+            format!("{:?}", lapin::ConnectionProperties::default()),
+            "an unnamed connection dials with lapin's own defaults"
+        );
+    }
+
+    #[test]
+    fn a_connection_name_reaches_the_handshake_properties() {
+        let options = RabbitMqOptions::default().connection_name("orders-worker");
+        assert_eq!(options.connection_name.as_deref(), Some("orders-worker"));
+
+        // The point of the option is what the broker is told, not what the
+        // struct holds, so assert on the translated properties. `lapin` carries
+        // the name as the `connection_name` client property, which is what
+        // RabbitMQ shows in the management UI; comparing against the same thing
+        // built by hand pins the translation without depending on how a
+        // `LongString` happens to render.
+        assert_eq!(
+            format!("{:?}", options.handshake_properties()),
+            format!(
+                "{:?}",
+                ConnectionProperties::default().with_connection_name("orders-worker".into())
+            ),
+        );
+        assert!(
+            format!("{:?}", options.handshake_properties()).contains("connection_name"),
+            "the name rides along as the `connection_name` client property"
+        );
+
+        // Naming the connection must not disturb anything else.
+        assert_eq!(options.dead_suffix, ".dead");
+        assert!(options.reconnect.is_some());
     }
 }

@@ -8,16 +8,24 @@
 //! Generated code needs a path to `queuey-core`. Both macros work that
 //! out from the *calling* crate's `Cargo.toml` (via `proc-macro-crate`):
 //!
-//! 1. a dependency on `queuey` (the facade), which emits
+//! 1. a dependency on `queuey-core`, which emits `::queuey_core`;
+//! 2. otherwise a dependency on `queuey` (the facade), which emits
 //!    `::queuey::__core`, its hidden re-export of the core crate;
-//! 2. otherwise a dependency on `queuey-core`, which emits
-//!    `::queuey_core`;
-//! 3. otherwise it falls back to `::queuey_core`.
+//! 3. otherwise a compile error naming the `crate = "..."` escape hatch below,
+//!    unless there was no manifest to read at all (a non-cargo build), in which
+//!    case it guesses `::queuey_core`.
+//!
+//! The core crate wins because a manifest is not a build graph: it does not say
+//! which target is compiling, and `[dev-dependencies]` are read along with
+//! `[dependencies]`. A crate that depends on `queuey-core` and keeps the facade
+//! for its tests only would otherwise be handed `::queuey::__core` in its lib,
+//! where the facade is not linked. `::queuey_core` is correct whenever the core
+//! crate is in the manifest at all, since the facade only re-exports it.
 //!
 //! Renamed dependencies (`aq = { package = "queuey" }`) are handled. For
 //! anything else (a vendored copy, a re-export under yet another name) say so
 //! explicitly with `#[queues(crate = "...")]` / `#[job(crate = "...")]`, which
-//! always wins.
+//! always wins and never reads the manifest.
 //!
 //! # Duration literals
 //!
@@ -49,6 +57,7 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(unreachable_pub)]
 
 mod attrs;
 mod duration;

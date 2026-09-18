@@ -32,4 +32,91 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # `RUSTFLAGS` does not reach rustdoc, so rustdoc's own lints — broken intra-doc
+      # links above all — need denying separately or they never fail CI.
       - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # `default = ["rabbitmq"]` advertises a broker-free configuration, so build and
+  # test it. This also covers the crate-level doctests, which is where a
+  # `RabbitMqBackend` in the quickstart last stopped compiling without the feature.
+  no-default-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+      - run: cargo test --workspace --no-default-features
+      # `RUSTFLAGS` does not reach rustdoc, so its lints need saying separately.
+      # An intra-doc link to a `rabbitmq`-only item is the same bug class as the
+      # doctest above and just as invisible with the feature on.
+      - run: cargo doc --workspace --no-deps --no-default-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # The MSRV is a published promise (`rust-version = "1.88"`), so compile with
+  # exactly that compiler. `rust-toolchain.toml` pins `channel = "stable"` and
+  # rustup obeys that file over whatever a toolchain action makes default;
+  # `RUSTUP_TOOLCHAIN` is the one setting that outranks it, so it is set for the
+  # whole job and the first step fails loudly if the wrong compiler is in front.
+  # `--locked` because an unpinned `cargo update` is exactly how an MSRV breaks.
+  msrv:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.88.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Confirm the MSRV toolchain is the one in front
+        run: |
+          rustc --version
+          rustc --version | grep -q '^rustc 1\.88\.0 ' || {
+            echo "::error::rust-toolchain.toml won: this is not the MSRV compiler"
+            exit 1
+          }
+      - run: cargo check --workspace --all-targets --locked
+      - run: cargo check --workspace --all-targets --locked --no-default-features
+
+  # What crates.io will actually receive. Versions there are immutable, so a
+  # missing licence text or a package that does not build from its own tarball
+  # has to be caught here and not after publishing.
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Every published crate carries both licence texts
+        run: |
+          for crate in queuey-core queuey-macros queuey-rabbitmq queuey; do
+            files=$(cargo package -p "$crate" --list)
+            for licence in LICENSE-MIT LICENSE-APACHE; do
+              echo "$files" | grep -qx "$licence" || {
+                echo "::error::$crate would be published without $licence"
+                exit 1
+              }
+            done
+          done
+      # `--workspace` packages all four against each other, so this works before
+      # anything is on crates.io; a dry run neither needs nor uses a token.
+      - run: cargo publish --workspace --dry-run
+
+  # The derives resolve `queuey-core` from the *consuming* crate's manifest, so
+  # the dependency shapes a user can have are only testable by building real
+  # crates. Opt-in because it shells out to cargo; see the test's own docs.
+  path-probe:
+    runs-on: ubuntu-latest
+    env:
+      QUEUEY_PATH_PROBE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p queuey-macros --test crate_path_probe

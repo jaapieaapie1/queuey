@@ -27,7 +27,12 @@ const DEFAULT_MAX: Duration = Duration::from_secs(30);
 /// *live* connection, most often because the queue is not there, and no amount
 /// of waiting fixes a queue an operator deleted: that is the case worth
 /// giving up on.
+///
+/// Non-exhaustive: the backend will learn to rebuild more than these two (a
+/// channel, a publisher confirm), and a policy that already matches on this must
+/// keep compiling when it does. Match with a `_` arm, or compare with `==`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Rebuilding {
     /// The AMQP connection itself.
     Connection,
@@ -52,11 +57,16 @@ pub struct Attempt<'a> {
 
     /// What failed last, or [`None`] when `failures` is `0`.
     ///
-    /// Deliberately a plain [`std::error::Error`] rather than a concrete type:
-    /// the two [`Rebuilding`] cases fail with different error types, and a
-    /// policy that wants the detail can `downcast_ref` to
-    /// [`lapin::Error`](crate::lapin::Error) or
-    /// [`queuey_core::Error`]. Most policies only read `failures`.
+    /// Deliberately a plain [`std::error::Error`] rather than a concrete type.
+    /// The two [`Rebuilding`] cases fail differently:
+    /// [`Rebuilding::Consumer`] carries a [`queuey_core::Error`], which a policy
+    /// may `downcast_ref` and match on, while [`Rebuilding::Connection`] carries
+    /// the error the underlying AMQP client returned. That one's concrete type
+    /// is an implementation detail and **not** part of this crate's 1.x
+    /// contract, precisely so the client can be upgraded without a major
+    /// version here; read it through [`Display`](std::fmt::Display) or
+    /// [`source`](std::error::Error::source). Most policies only read
+    /// `failures`.
     pub error: Option<&'a (dyn std::error::Error + 'static)>,
 
     /// Which of the two things is being rebuilt.
@@ -171,7 +181,13 @@ pub trait ReconnectPolicy: Send + Sync + Debug {
 /// Set [`RabbitMqOptions::reconnect`](crate::RabbitMqOptions::reconnect) to
 /// [`None`] to turn reconnection off entirely and get the original fail-fast
 /// behaviour back.
+///
+/// Non-exhaustive: build one from [`BackoffPolicy::default`] and the
+/// [`max_attempts`](Self::max_attempts) / [`backoff`](Self::backoff) builders,
+/// so a knob added in 1.x (a per-[`Rebuilding`] limit, a deadline) stays a minor
+/// release. The fields stay public, so reading them needs nothing extra.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct BackoffPolicy {
     /// How many consecutive attempts to make before giving up, or [`None`] to
     /// keep trying indefinitely.
@@ -199,12 +215,7 @@ impl Default for BackoffPolicy {
     fn default() -> Self {
         Self {
             max_attempts: None,
-            backoff: Backoff::Exponential {
-                base: DEFAULT_BASE,
-                factor: 2.0,
-                max: DEFAULT_MAX,
-                jitter: true,
-            },
+            backoff: Backoff::exponential_with(DEFAULT_BASE, 2.0, DEFAULT_MAX, true),
         }
     }
 }
@@ -272,6 +283,7 @@ mod tests {
             factor,
             max,
             jitter,
+            ..
         } = policy.backoff
         else {
             panic!("the default must be exponential");
@@ -315,12 +327,12 @@ mod tests {
     #[test]
     fn the_delay_grows_and_is_capped() {
         // Without jitter the schedule is exact, so it can be asserted on.
-        let policy = BackoffPolicy::default().backoff(Backoff::Exponential {
-            base: Duration::from_millis(500),
-            factor: 2.0,
-            max: Duration::from_secs(30),
-            jitter: false,
-        });
+        let policy = BackoffPolicy::default().backoff(Backoff::exponential_with(
+            Duration::from_millis(500),
+            2.0,
+            Duration::from_secs(30),
+            false,
+        ));
         assert_eq!(delay(&policy, 1), Some(Duration::from_millis(500)));
         assert_eq!(delay(&policy, 2), Some(Duration::from_secs(1)));
         assert_eq!(delay(&policy, 3), Some(Duration::from_secs(2)));

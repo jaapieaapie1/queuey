@@ -1,13 +1,13 @@
 //! Expansion of `#[derive(Job)]`.
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::spanned::Spanned;
 use syn::{Attribute, DeriveInput, Meta, Path};
 
 use crate::attrs::{
     Keyed, RetrySpec, default_crate_path, key_name, lit_str, parse_crate_path, parse_retry,
-    set_once,
+    reject_blank, respan, set_once,
 };
 
 /// Parsed `#[job(...)]` options.
@@ -21,10 +21,15 @@ pub(crate) struct JobAttr {
 
 impl JobAttr {
     /// The resolved path to `queuey-core`.
-    pub(crate) fn core_path(&self) -> Path {
-        self.core
-            .as_ref()
-            .map_or_else(default_crate_path, |keyed| keyed.value.clone())
+    ///
+    /// `span` is only used to place the diagnostic when neither crate is a
+    /// dependency; an explicit `crate = "..."` never consults the manifest, so
+    /// it still works in a build `proc-macro-crate` cannot make sense of.
+    pub(crate) fn core_path(&self, span: Span) -> syn::Result<Path> {
+        match &self.core {
+            Some(keyed) => Ok(keyed.value.clone()),
+            None => default_crate_path(span, "job"),
+        }
     }
 }
 
@@ -46,7 +51,14 @@ pub(crate) fn parse_job_attr(attrs: &[Attribute]) -> syn::Result<JobAttr> {
                 Ok(())
             } else if meta.path.is_ident("name") {
                 let lit = lit_str(&meta)?;
-                set_once(&mut parsed.name, &meta, lit.value())
+                // Same rule as `#[queue(name = ...)]`, and for a stronger
+                // reason: this string is `Job::NAME`, which lands in every
+                // envelope's `job_type` and is the key the worker dispatches
+                // handlers on. A blank one is unroutable and unreadable.
+                reject_blank(&lit, "name")?;
+                set_once(&mut parsed.name, &meta, lit.value())?;
+                respan(&mut parsed.name, lit.span());
+                Ok(())
             } else if meta.path.is_ident("retry") {
                 let spec = parse_retry(&meta)?;
                 set_once(&mut parsed.retry, &meta, spec)
@@ -91,7 +103,7 @@ pub(crate) fn derive(input: &DeriveInput) -> syn::Result<TokenStream> {
     }
 
     let attr = parse_job_attr(&input.attrs)?;
-    let core = attr.core_path();
+    let core = attr.core_path(input.ident.span())?;
 
     let queue = attr.queue.as_ref().ok_or_else(|| {
         let span = input
@@ -176,14 +188,14 @@ mod tests {
         );
         assert_eq!(parsed.name.as_ref().unwrap().value, "emails.send");
         assert_eq!(parsed.retry.as_ref().unwrap().value.max_attempts, 5);
-        let core = parsed.core_path();
+        let core = parsed.core_path(Span::call_site()).unwrap();
         assert_eq!(quote!(#core).to_string(), ":: queuey");
     }
 
     #[test]
     fn defaults_to_core_crate() {
         let parsed = job_of(quote!(#[job(queue = AppQueues::Emails)])).unwrap();
-        let core = parsed.core_path();
+        let core = parsed.core_path(Span::call_site()).unwrap();
         assert_eq!(quote!(#core).to_string(), ":: queuey_core");
         assert!(parsed.retry.is_none());
         assert!(parsed.name.is_none());
@@ -200,6 +212,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("duplicate key `queue`"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_blank_name() {
+        // `Job::NAME` is the envelope's `job_type` and the handler-dispatch
+        // key; a blank one routes to nothing and reads as nothing.
+        let err = job_of(quote!(#[job(queue = A::B, name = "")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`name` must not be empty"), "{err}");
+
+        let err = job_of(quote!(#[job(queue = A::B, name = "   ")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`name` must not be only whitespace"), "{err}");
+
+        // A name with inner spaces is unusual but routable, so it stays legal.
+        assert!(job_of(quote!(#[job(queue = A::B, name = "send email")])).is_ok());
     }
 
     #[test]

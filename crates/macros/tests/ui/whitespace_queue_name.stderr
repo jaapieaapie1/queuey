@@ -1,0 +1,5 @@
+error: `name` must not be only whitespace
+ --> tests/ui/whitespace_queue_name.rs:5:20
+  |
+5 |     #[queue(name = "   ")]
+  |                    ^^^^^

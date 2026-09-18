@@ -222,12 +222,7 @@ fn config_retry_exponential_with_explicit_values() {
         AppQueues::Images.config().retry,
         RetryPolicy::new(
             3,
-            Backoff::Exponential {
-                base: Duration::from_secs(1),
-                factor: 2.0,
-                max: Duration::from_secs(120),
-                jitter: true,
-            }
+            Backoff::exponential_with(Duration::from_secs(1), 2.0, Duration::from_secs(120), true,)
         )
     );
 }
@@ -246,12 +241,12 @@ fn config_retry_fully_tuned_exponential() {
         Plain::FullyTuned.config().retry,
         RetryPolicy::new(
             9,
-            Backoff::Exponential {
-                base: Duration::from_millis(250),
-                factor: 1.5,
-                max: Duration::from_secs(3600),
-                jitter: false,
-            }
+            Backoff::exponential_with(
+                Duration::from_millis(250),
+                1.5,
+                Duration::from_secs(3600),
+                false,
+            )
         )
     );
 }

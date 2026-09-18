@@ -98,12 +98,31 @@ that is already gone, which is the failure this exists to prevent. Consequences,
 ## Macro attribute grammar
 
 `#[derive(Queues)]` on a fieldless enum:
-- container `#[queues(prefix = "str")]`, optional. Name = `prefix + "." + name` if set.
-- variant `#[queue(name = "str", prefetch = u16, durable = bool, message_ttl = "dur", retry(...))]`, all optional.
+- container `#[queues(prefix = "str", crate = "path")]`, both optional. Name = `prefix + "." + name`
+  if set; the separator is added by the macro, so a `prefix` that already ends in `.` is an error
+  rather than a silent `a..b`.
+- variant `#[queue(name = "str", prefetch = u16, durable = bool, message_ttl = "dur",
+  max_priority = u8, retry(...))]`, all optional.
 - `retry(max_attempts = u32, backoff = "none" | "fixed" | "exponential", delay = "dur" (fixed), base = "dur", factor = f64, max = "dur", jitter = bool)`.
-- durations: humantime-ish literal strings `"500ms"`, `"1s"`, `"2m"`, `"1h"`. Parse at macro time; emit `Duration::from_millis(n)`.
+- durations: humantime-ish literal strings `"500ms"`, `"1s"`, `"2m"`, `"1h"`, `"7d"`; a bare integer
+  (`"30"`) is seconds. Parse at macro time; emit `Duration::from_millis(n)`.
 - generates `impl QueueSet` (`all`, `name`, `config`) with `&'static str` names.
 - errors: non-enum, variants with fields, duplicate names, unknown keys, bad duration -> `compile_error!` spanned on the offending token.
+- **Core path resolution**, which `crate = "..."` always overrides and which never reads the
+  manifest when it is given: the facade expanding *itself* -> `::queuey::__core`; else
+  `queuey-core` in the calling manifest -> `::queuey_core`; else `queuey` ->
+  `::queuey::__core`; else a `compile_error!` naming the override — unless there was no
+  manifest to read at all (a non-cargo build), where it guesses `::queuey_core`. The core
+  crate goes first because `proc-macro-crate` sees one manifest and not the build graph: it
+  merges `[dependencies]` with `[dev-dependencies]` and cannot say which target is
+  compiling, so a crate that keeps the facade for its tests only would otherwise get a path
+  its lib cannot resolve. `::queuey_core` is right whenever the core crate is named at all,
+  since the facade only re-exports it. The `Itself` case comes first for the opposite
+  reason: `queuey-core` is one of the facade's own dependencies, and this workspace
+  exercises `::queuey::__core` nowhere else.
+- **Both helper attributes are inert on the whole item** (`attributes(queues, queue)`), so a
+  `#[queue(...)]` on the enum or a `#[queues(...)]` on a variant would otherwise be dropped
+  silently, unknown keys included. Each is rejected, naming the attribute that belongs there.
 
 `#[derive(Job)]` on any struct/enum that is also `Serialize + DeserializeOwned`:
 - `#[job(queue = Path::Variant)]`, required.
@@ -112,9 +131,17 @@ that is already gone, which is the failure this exists to prevent. Consequences,
 - `Job::Queue` is inferred as the type of the path minus the last segment (`AppQueues`).
 
 Validation (all `compile_error!` spanned on the offending token):
-- `prefix` and `name` must not be empty, and the resolved queue name must not be empty either.
+- `prefix`, `#[queue(name)]` and `#[job(name)]` must not be empty **or only whitespace**, and the
+  resolved queue name must not be empty either. All three end up in the wire format: a queue name
+  on the broker, a job name in every envelope's `job_type` and in the handler-dispatch key.
+- `prefix` must not end with `.`; the separator is added by `qualify`.
 - `prefetch` must be an integer in `1..=65535`. `prefetch = 0` is rejected: 0 means *unlimited* in
   AMQP, so omit the attribute (default 16) instead.
+- `message_ttl` must be in `1ms..=4294967295ms` (~49.7 days). RabbitMQ parses `x-message-ttl` as an
+  unsigned 32-bit millisecond count, and `crates/rabbitmq/src/topology.rs` clamps to `MAX_TTL_MS`
+  rather than let the declare close the channel; a value written in source is rejected instead of
+  clamped. (Not to be confused with `MAX_DEFERRAL_MS = MAX_TTL_MS / 2`, which bounds a *hold queue*
+  delay, not a queue's message TTL.)
 - `max_attempts` must be an integer in `1..=u32::MAX`. `max_attempts = 0` is rejected; `1` already
   means "no retries".
 - A wrong-typed, negative or out-of-range integer reports the key and its range, never syn's raw
@@ -149,14 +176,46 @@ Rules that hold for the whole of 1.x:
   it to the handler as `JobContext::correlation_id`, and the dead-letter hook sees it on
   `DeadLetter::envelope`. It exists so a job can be tied back to the request that
   created it across services; the library reads nothing from it.
-- Every public struct with public fields and every public enum is `#[non_exhaustive]`
-  (`Envelope`, `QueueConfig`, `JobContext`, `RetryPolicy`, `Backoff`, `RetryDecision`,
-  `Error`, `JobError`, `AckKind`, `DeadLetter`, `DeadLetterCause`, `Attempt`), so
-  adding a field or a variant stays a minor release. Construction goes through
-  `QueueConfig::new`, `RetryPolicy::new`, `Envelope::new` / `Envelope::raw` and the
-  builders, and downstream `match` arms need a wildcard.
+- Every public struct with public fields and every public enum is `#[non_exhaustive]`, so
+  adding a field or a variant stays a minor release:
+  - `queuey-core`: `Envelope`, `QueueConfig`, `JobContext`, `RetryPolicy`, `Backoff`,
+    `RetryDecision`, `Error`, `JobError`, `AckKind`, `EnqueueOptions`, `DeadLetter`,
+    `DeadLetterCause`;
+  - `queuey-rabbitmq`: `RabbitMqOptions`, `BackoffPolicy`, `Attempt`, `Rebuilding`.
+- **Struct *variants* carry it too**, because the enum-level attribute only reserves the
+  right to add variants: a struct variant without it is still constructible and
+  exhaustively matchable downstream, so adding a field to one would be breaking.
+  `Backoff::Exponential`, `RetryDecision::Retry` and `JobError::Deferred` are each
+  `#[non_exhaustive]` in their own right.
+- Construction goes through `QueueConfig::new`, `RetryPolicy::new`, `Envelope::new` /
+  `Envelope::raw`, `Backoff::exponential_with`, `RetryDecision::retry`,
+  `JobError::deferred` / `deferred_msg`, `JobContext::new`, `DeadLetter::new`,
+  `RabbitMqOptions::default`, `BackoffPolicy::default`, `Attempt::first` / `after` and
+  the builders. Downstream `match` arms need a wildcard, and a struct-variant pattern
+  needs a `..` rest.
+- `JobContext::new` and `DeadLetter::new` exist for one reason: without them a user cannot
+  unit-test their own `JobHandler` or `DeadLetterHook`, because the only other way to get
+  one of those values is to stand up a `MemoryBackend` plus a `Worker` and drive a real
+  delivery through it.
+- `Backoff` is `Serialize`/`Deserialize`, so a policy can be persisted. Any field added to
+  `Backoff::Exponential` in 1.x carries `#[serde(default)]`, for the same reason the
+  envelope's do; `retry::tests::todays_policy_json_round_trips_byte_for_byte` pins the
+  current document.
 - `Backend` and `Delivery` are implementable outside the workspace and only ever gain
   defaulted methods in 1.x. See the stability note in `crates/core/src/backend.rs`.
+- **No `lapin` type appears anywhere in `queuey-rabbitmq`'s public surface** — not in a
+  signature, a public field, a re-export or a trait impl. `lapin` went 2 -> 3 -> 4 in
+  short order, and one leak would make a `lapin` 5.0 into a `queuey` 2.0; sealed this way,
+  a `lapin` upgrade is a patch release. So `codec` and `topology::{queue_args,
+  deferred_queue_args, dead_queue_args}` are crate-private, there is no `pub use lapin`,
+  and nothing hands out the connection or a channel on it. The cost is accepted: an
+  application that also speaks raw AMQP depends on `lapin` and opens its own connection.
+  The one handshake detail worth steering from outside is
+  `RabbitMqOptions::connection_name: Option<String>`, translated internally into
+  `ConnectionProperties::with_connection_name` on every dial, so a named connection keeps
+  its name across a reconnect. `client_properties` beyond the name, the AMQP `locale`
+  (RabbitMQ advertises only `en_US`), a custom executor/reactor/auth provider and `lapin`'s
+  own `enable_auto_recover` are deliberately *not* configurable.
 
 ## Retry semantics
 
@@ -179,6 +238,13 @@ Rules that hold for the whole of 1.x:
   override affects `JobContext::max_attempts` so `ctx.is_last_attempt()` stays truthful. An override
   naming a queue or job type this worker has no handler for is inert and logged at `DEBUG`.
 - `Backoff::Exponential`: `min(max, base * factor^(attempt-1))`, saturating; full jitter `U[0, d]` if enabled.
+  Built with `Backoff::exponential_with(base, factor, max, jitter)` (the variant is
+  `#[non_exhaustive]`) or `Backoff::exponential()` for the defaults; the derives emit the former.
+- `WorkerBuilder::job_timeout(Duration)`, default none: a handler still running after `timeout`
+  is aborted and the attempt counts as `JobError::Retryable`, so the policy decides what happens
+  next. It is per worker process, like the runtime retry overrides, because how long a job may
+  reasonably take is an operational judgement; the handler's own task is aborted, so a handler
+  that must clean up does so in a guard, not after the `await`.
 
 ## RabbitMQ topology (per queue `q`)
 
@@ -205,8 +271,19 @@ Rules that hold for the whole of 1.x:
   DLX policy on `q` applies if configured, otherwise the message is dropped) and logs at `WARN`.
 - Envelope JSON body, `content_type = application/json`, `delivery_mode = persistent`,
   `message_id = job_id`, `type = job_type`.
-- Connection: single `lapin::Connection`, one channel for publishing (confirm mode), one channel
-  for hold queue declarations, one channel per consumer.
+- Connection: single `lapin::Connection`; a pool of at most `RabbitMqOptions::publish_concurrency`
+  (default 8) publishing channels in confirm mode, each carrying **one publish at a time**; one
+  channel for hold queue declarations; one channel per consumer. All of them are the backend's own;
+  nothing hands one out (see the `lapin` bullet under Wire format and stability).
+- Publisher confirms: a publish holds its channel until the confirmation arrives, and that is a
+  correctness requirement, not tidiness. `lapin` does not key a `basic.return` to a delivery tag —
+  returned messages are queued per channel and attached to whichever pending tag the confirm
+  handler resolves first, which for the `basic.ack(multiple = true)` RabbitMQ sends when it
+  coalesces confirms is `HashMap` order. Two publishes in flight on one channel can therefore swap
+  outcomes: the unroutable one resolves as a bare `Ack`, is reported as **success**, and the
+  delivery waiting on it acks an original whose successor went nowhere — a job lost with nothing
+  logged. One publish per channel makes that impossible; concurrency comes from the pool, and
+  `publish_concurrency` is the ceiling on publisher confirms outstanding at once.
 - Reconnect: the connection is a slot, not a socket. A drop is repaired by whichever
   operation notices first, single-flight behind a mutex, paced by a `ReconnectPolicy`
   (default `BackoffPolicy`: unlimited, jittered exponential, 500ms base, capped at 30s).
@@ -221,7 +298,9 @@ Rules that hold for the whole of 1.x:
   a mutex. N consumers on a backend do not become N connections.
 - **Generation.** A counter of successful connections, bumped after the swap. A consumer
   records it when it subscribes, so it can tell "my connection died" from "somebody already
-  replaced it".
+  replaced it". Internal to `ConnectionHandle`: it is not on the public surface, because the
+  only caller that ever needed to read it was a holder of a borrowed channel, and nothing
+  borrows one.
 - **Replay.** Every `QueueConfig` passed to `declare` is remembered on the handle, and
   re-declared on the new connection (`declare_topology`, shared with `declare` itself so
   the two cannot drift). A broker that *restarted* has lost every non-durable queue and
@@ -330,7 +409,7 @@ their own `retry_granularity`.)
   rather than released early. Because every message in a hold queue has the same TTL, the queue
   drains strictly in order: no head-of-line blocking. Idle hold queues delete themselves one TTL
   after their last message left.
-- Hold queues are declared on a **dedicated declaration channel**, never on the confirm
+- Hold queues are declared on a **dedicated declaration channel**, never on a confirm
   publishing channel: a declare the broker rejects closes the channel it ran on, and that must
   not take unrelated in-flight publishes down with it.
 - Deferral requires the target queue to have been declared through the same backend instance
@@ -374,7 +453,7 @@ their own `retry_granularity`.)
   `x-max-priority` and deferral still round-trips; redeclaring an existing queue with a
   different `max_priority` surfaces `PRECONDITION_FAILED` as an `Err`, not a hang; a hold queue
   pre-declared by a foreign process with different arguments makes `defer` return `Err` while
-  the original delivery stays **unacked** and the confirm publishing channel stays usable
+  the original delivery stays **unacked** and the confirm publishing channels stay usable
   (the declaration channel is the only casualty); `defer` onto a queue this backend never
   declared -> `Error::UnknownQueue`, nothing published; a delay past `MAX_DEFERRAL_MS` is
   refused with an `Err` instead of being released early; a 500ms retry waits in `q.deferred.1000`
@@ -395,11 +474,25 @@ their own `retry_granularity`.)
   Tests synchronise on observable state (backend inspection helpers, virtual time), never
   on wall-clock sleeps or scheduling order.
 - macros: `trybuild` pass/fail cases + expansion assertions via the generated impl (`QueueSet::all`,
-  `name`, `config`, `Job::NAME`, `Job::QUEUE`, `retry_policy`).
+  `name`, `config`, `Job::NAME`, `Job::QUEUE`, `retry_policy`). Core path resolution is unit tested
+  as a pure precedence table (`attrs::tests::crate_path_precedence`), because the decision is
+  separated from the environment it reads; `tests/crate_path_probe.rs` then writes real crates for
+  the three dependency shapes (core only, facade only, core with the facade as a dev-dependency)
+  and builds and tests each with a nested cargo. No `trybuild` case can cover this: they all share
+  the macro crate's own manifest. The probe is opt-in behind `QUEUEY_PATH_PROBE`, with the same
+  skip-notice convention as `AMQP_URL`.
 - rabbitmq: pure unit tests for topology naming, header/property mapping, envelope <-> lapin
-  `BasicProperties`; integration tests behind `AMQP_URL` env var (`#[ignore]`-free but early-return
-  with an `eprintln!` skip notice when unset), exercising declare / publish / consume / retry /
-  defer / dead-letter.
+  `BasicProperties`, and the confirm-pool size clamp; integration tests behind `AMQP_URL` env var
+  (`#[ignore]`-free but early-return with an `eprintln!` skip notice when unset), exercising
+  declare / publish / consume / retry / defer / dead-letter. Two of them guard the
+  publish-before-ack contract at its failing edge: `dead_letter` into a `q.dead` an operator
+  deleted must return `Err` and leave the original unacked, and a `basic.return` must be reported
+  against the publish that caused it and no other. The second is probabilistic, so it repeats:
+  300 rounds of ten concurrent publishes with one unroutable. The constants come from measurement
+  against RabbitMQ 4 — below ten in flight, or with the unroutable publish first, the broker's
+  confirms happen to arrive in an order that attributes correctly and nothing is proved; at ten
+  with it in the middle a shared channel misattributes on roughly one round in fifteen, so 300
+  rounds leave a regression passing with probability on the order of `e^-20`.
 - facade: compile-fail test proving cross-queue-set enqueue is rejected; end-to-end example; an
   end-to-end pass over the dead-letter hook and retry overrides through the derives only
   (`tests/e2e_dead_letter.rs`), since those are configured on the builder a downstream user holds.
@@ -409,3 +502,16 @@ their own `retry_granularity`.)
 - edition 2024, MSRV 1.88, `#![forbid(unsafe_code)]`, `#![warn(missing_docs)]` on public crates.
 - `cargo clippy --workspace --all-targets -- -D warnings` must pass. `cargo fmt` clean.
 - `tracing` for logs, never `println!` in library code.
+- CI runs, besides the default-feature job: `cargo test --workspace --no-default-features`
+  (the no-broker configuration the `rabbitmq` feature advertises, clippy and docs included),
+  `cargo publish --workspace --dry-run` with a check that both licence texts are inside every
+  package, an MSRV job, and the macro path probe. `RUSTFLAGS` does not reach rustdoc, so the
+  doc step sets `RUSTDOCFLAGS` itself.
+- The MSRV is compiled, not just declared. `rust-toolchain.toml` pins `channel = "stable"` and
+  rustup obeys it over any installed toolchain, so the MSRV job sets `RUSTUP_TOOLCHAIN: "1.88.0"`,
+  which outranks the file, and asserts `rustc --version` before checking anything. It uses
+  `--locked`: an unpinned `cargo update` is how an MSRV breaks without anyone noticing.
+- `LICENSE-MIT` and `LICENSE-APACHE` are duplicated into each crate directory. A published crate
+  contains only its own directory, and both licences require their text to travel with the
+  distribution. Real files, not symlinks: cargo's handling of symlinks in packages is not worth
+  gambling a permanent, immutable release on.

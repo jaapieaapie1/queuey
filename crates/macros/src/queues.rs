@@ -8,8 +8,9 @@ use syn::spanned::Spanned;
 use syn::{Attribute, Data, DeriveInput, Fields, Ident, LitStr, Meta, Path, Variant};
 
 use crate::attrs::{
-    Keyed, MAX_PRIORITY_RANGE, PREFETCH_RANGE, RetrySpec, default_crate_path, key_name, lit_bool,
-    lit_int, lit_str, parse_crate_path, parse_retry, set_once,
+    Keyed, MAX_MESSAGE_TTL_MS, MAX_PRIORITY_RANGE, MESSAGE_TTL_RANGE, PREFETCH_RANGE, RetrySpec,
+    default_crate_path, key_name, lit_bool, lit_int, lit_str, parse_crate_path, parse_retry,
+    reject_blank, respan, set_once,
 };
 use crate::duration;
 
@@ -22,13 +23,24 @@ pub(crate) struct ContainerAttr {
 
 impl ContainerAttr {
     /// The resolved path to `queuey-core`.
-    pub(crate) fn core_path(&self) -> Path {
-        self.core
-            .as_ref()
-            .map_or_else(default_crate_path, |keyed| keyed.value.clone())
+    ///
+    /// `span` is only used to place the diagnostic when neither crate is a
+    /// dependency; an explicit `crate = "..."` never consults the manifest, so
+    /// it still works in a build `proc-macro-crate` cannot make sense of.
+    pub(crate) fn core_path(&self, span: Span) -> syn::Result<Path> {
+        match &self.core {
+            Some(keyed) => Ok(keyed.value.clone()),
+            None => default_crate_path(span, "queues"),
+        }
     }
 
     /// Apply the optional prefix to a bare queue name.
+    ///
+    /// The `.` between the two is added here and nowhere else, which is why a
+    /// `prefix` ending in one is rejected at parse time: writing `prefix = "a."`
+    /// used to produce `a..b`, a legal but nonsensical broker queue name that
+    /// nothing would ever have noticed until an operator looked at the
+    /// management UI.
     pub(crate) fn qualify(&self, name: &str) -> String {
         match &self.prefix {
             Some(prefix) => format!("{}.{}", prefix.value, name),
@@ -36,6 +48,9 @@ impl ContainerAttr {
         }
     }
 }
+
+/// Separator [`ContainerAttr::qualify`] puts between the prefix and the name.
+const PREFIX_SEPARATOR: char = '.';
 
 /// Variant level `#[queue(...)]` options.
 #[derive(Debug, Default)]
@@ -51,6 +66,7 @@ pub(crate) struct QueueAttr {
 /// Parse every `#[queues(...)]` attribute on the enum.
 pub(crate) fn parse_container_attr(attrs: &[Attribute]) -> syn::Result<ContainerAttr> {
     let mut parsed = ContainerAttr::default();
+    reject_misplaced(attrs, "queue", "queues", "a variant", "the enum")?;
     for attr in attrs.iter().filter(|a| a.path().is_ident("queues")) {
         if matches!(attr.meta, Meta::Path(_)) {
             continue;
@@ -58,7 +74,8 @@ pub(crate) fn parse_container_attr(attrs: &[Attribute]) -> syn::Result<Container
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("prefix") {
                 let lit = lit_str(&meta)?;
-                reject_empty(&lit, "prefix")?;
+                reject_blank(&lit, "prefix")?;
+                reject_trailing_separator(&lit)?;
                 set_once(&mut parsed.prefix, &meta, lit.value())?;
                 respan(&mut parsed.prefix, lit.span());
                 Ok(())
@@ -82,6 +99,7 @@ pub(crate) fn parse_container_attr(attrs: &[Attribute]) -> syn::Result<Container
 /// Parse every `#[queue(...)]` attribute on one variant.
 pub(crate) fn parse_queue_attr(attrs: &[Attribute]) -> syn::Result<QueueAttr> {
     let mut parsed = QueueAttr::default();
+    reject_misplaced(attrs, "queues", "queue", "the enum", "a variant")?;
     for attr in attrs.iter().filter(|a| a.path().is_ident("queue")) {
         if matches!(attr.meta, Meta::Path(_)) {
             continue;
@@ -89,7 +107,7 @@ pub(crate) fn parse_queue_attr(attrs: &[Attribute]) -> syn::Result<QueueAttr> {
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("name") {
                 let lit = lit_str(&meta)?;
-                reject_empty(&lit, "name")?;
+                reject_blank(&lit, "name")?;
                 set_once(&mut parsed.name, &meta, lit.value())?;
                 respan(&mut parsed.name, lit.span());
                 Ok(())
@@ -108,7 +126,19 @@ pub(crate) fn parse_queue_attr(attrs: &[Attribute]) -> syn::Result<QueueAttr> {
             } else if meta.path.is_ident("message_ttl") {
                 let lit = lit_str(&meta)?;
                 let millis = duration::parse_lit(&lit, "message_ttl")?;
-                set_once(&mut parsed.message_ttl, &meta, millis)
+                if millis > MAX_MESSAGE_TTL_MS {
+                    return Err(syn::Error::new(
+                        lit.span(),
+                        format!(
+                            "`message_ttl` must be {MESSAGE_TTL_RANGE}: a broker stores it as an \
+                             unsigned 32-bit millisecond count, so a longer TTL cannot be \
+                             expressed and would be silently clamped"
+                        ),
+                    ));
+                }
+                set_once(&mut parsed.message_ttl, &meta, millis)?;
+                respan(&mut parsed.message_ttl, lit.span());
+                Ok(())
             } else if meta.path.is_ident("max_priority") {
                 let value = lit_int::<u8>(&meta, MAX_PRIORITY_RANGE)?;
                 set_once(&mut parsed.max_priority, &meta, value)
@@ -127,20 +157,50 @@ pub(crate) fn parse_queue_attr(attrs: &[Attribute]) -> syn::Result<QueueAttr> {
     Ok(parsed)
 }
 
-/// Reject an empty string literal, spanned at the literal itself.
-fn reject_empty(lit: &LitStr, key: &str) -> syn::Result<()> {
-    if lit.value().is_empty() {
+/// Reject a `prefix` that already ends in the separator `qualify` adds.
+///
+/// `#[queues(prefix = "a.")]` used to expand to the queue name `a..b`. Rejecting
+/// is the better of the two possible fixes: swallowing the extra separator would
+/// mean two different sources produce the same broker queue name, and a queue
+/// name is wire format an operator reads. Saying so at the offending literal
+/// costs the author one character.
+fn reject_trailing_separator(lit: &LitStr) -> syn::Result<()> {
+    if lit.value().ends_with(PREFIX_SEPARATOR) {
         return Err(syn::Error::new(
             lit.span(),
-            format!("`{key}` must not be empty"),
+            format!(
+                "`prefix` must not end with `{PREFIX_SEPARATOR}`: the separator before the queue \
+                 name is added for you, so `prefix = \"myapp\"` already yields `myapp.emails`"
+            ),
         ));
     }
     Ok(())
 }
 
-fn respan<T>(slot: &mut Option<Keyed<T>>, span: Span) {
-    if let Some(keyed) = slot.as_mut() {
-        keyed.span = span;
+/// Reject a helper attribute that belongs on the other level of the item.
+///
+/// `#[derive(Queues)]` registers both `queues` and `queue`, which makes both
+/// *inert* anywhere on the enum. A `#[queue(...)]` on the container or a
+/// `#[queues(...)]` on a variant therefore used to compile clean and be dropped
+/// on the floor, unknown keys and all: the author's `prefix` or `prefetch`
+/// silently did nothing. `wrong` is the attribute that was written, `right` the
+/// one that belongs here.
+fn reject_misplaced(
+    attrs: &[Attribute],
+    wrong: &str,
+    right: &str,
+    wrong_place: &str,
+    right_place: &str,
+) -> syn::Result<()> {
+    match attrs.iter().find(|a| a.path().is_ident(wrong)) {
+        Some(attr) => Err(syn::Error::new_spanned(
+            attr.path(),
+            format!(
+                "`#[{wrong}(...)]` belongs on {wrong_place}; {right_place} takes \
+                 `#[{right}(...)]`"
+            ),
+        )),
+        None => Ok(()),
     }
 }
 
@@ -208,7 +268,7 @@ pub(crate) fn derive(input: &DeriveInput) -> syn::Result<TokenStream> {
     }
 
     let container = parse_container_attr(&input.attrs)?;
-    let core = container.core_path();
+    let core = container.core_path(input.ident.span())?;
 
     let mut resolved: Vec<ResolvedQueue<'_>> = Vec::with_capacity(data.variants.len());
     for variant in &data.variants {
@@ -376,7 +436,7 @@ mod tests {
     fn container_defaults_to_core_crate() {
         let parsed = container_of(quote!()).unwrap();
         assert!(parsed.prefix.is_none());
-        let core = parsed.core_path();
+        let core = parsed.core_path(Span::call_site()).unwrap();
         assert_eq!(quote!(#core).to_string(), ":: queuey_core");
         assert_eq!(parsed.qualify("emails"), "emails");
     }
@@ -385,7 +445,7 @@ mod tests {
     fn container_prefix_and_crate() {
         let parsed = container_of(quote!(#[queues(prefix = "myapp", crate = "queuey")])).unwrap();
         assert_eq!(parsed.qualify("emails"), "myapp.emails");
-        let core = parsed.core_path();
+        let core = parsed.core_path(Span::call_site()).unwrap();
         assert_eq!(quote!(#core).to_string(), ":: queuey");
     }
 
@@ -541,6 +601,65 @@ mod tests {
     }
 
     #[test]
+    fn a_helper_attribute_on_the_wrong_level_is_an_error_not_a_silent_drop() {
+        // `#[derive(Queues)]` registers both names, so both are inert anywhere
+        // on the item and used to be dropped without a word.
+        let err = container_of(quote!(#[queue(prefix = "myapp", nonsense = 1)]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`#[queue(...)]` belongs on a variant"),
+            "{err}"
+        );
+        assert!(err.contains("`#[queues(...)]`"), "{err}");
+
+        let err = queue_of(quote!(#[queues(prefix = "myapp")]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`#[queues(...)]` belongs on the enum"),
+            "{err}"
+        );
+        assert!(err.contains("`#[queue(...)]`"), "{err}");
+
+        // The right attribute in the right place is of course still fine.
+        assert!(container_of(quote!(#[queues(prefix = "myapp")])).is_ok());
+        assert!(queue_of(quote!(#[queue(prefetch = 4)])).is_ok());
+    }
+
+    #[test]
+    fn a_prefix_must_not_end_in_the_separator_qualify_adds() {
+        let err = container_of(quote!(#[queues(prefix = "a.")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`prefix` must not end with `.`"), "{err}");
+        assert!(err.contains("added for you"), "{err}");
+
+        // Dots *inside* a prefix are a normal AMQP namespace and stay legal.
+        let parsed = container_of(quote!(#[queues(prefix = "myapp.jobs")])).unwrap();
+        assert_eq!(parsed.qualify("emails"), "myapp.jobs.emails");
+    }
+
+    #[test]
+    fn queue_rejects_a_message_ttl_a_broker_cannot_express() {
+        for attr in [
+            quote!(#[queue(message_ttl = "100d")]),
+            quote!(#[queue(message_ttl = "4294967296ms")]),
+        ] {
+            let err = queue_of(attr).unwrap_err().to_string();
+            assert!(err.contains("`message_ttl` must be between"), "{err}");
+            assert!(err.contains("4294967295ms"), "{err}");
+            assert!(err.contains("49.7 days"), "{err}");
+        }
+
+        // The ceiling itself is accepted.
+        let parsed = queue_of(quote!(#[queue(message_ttl = "4294967295ms")])).unwrap();
+        assert_eq!(parsed.message_ttl.unwrap().value, MAX_MESSAGE_TTL_MS);
+        // And a realistic TTL is nowhere near it.
+        assert!(queue_of(quote!(#[queue(message_ttl = "7d")])).is_ok());
+    }
+
+    #[test]
     fn empty_names_are_rejected() {
         let err = container_of(quote!(#[queues(prefix = "")]))
             .unwrap_err()
@@ -557,6 +676,26 @@ mod tests {
         };
         let err = derive(&all_underscores).unwrap_err().to_string();
         assert!(err.contains("queue name is empty"), "{err}");
+    }
+
+    #[test]
+    fn whitespace_only_names_are_rejected_too() {
+        // `"   "` is a legal AMQP queue name and a completely useless one.
+        for text in ["   ", "\t", " \n "] {
+            let lit = proc_macro2::Literal::string(text);
+            let err = queue_of(quote!(#[queue(name = #lit)]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("`name` must not be only whitespace"), "{err}");
+
+            let err = container_of(quote!(#[queues(prefix = #lit)]))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("`prefix` must not be only whitespace"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

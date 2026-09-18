@@ -1,14 +1,17 @@
-//! The shared publishing channels: one in confirm mode for publishes, one plain
-//! channel for the on-demand hold queue declarations.
+//! The shared publishing channels: a small pool in confirm mode for publishes,
+//! one plain channel for the on-demand hold queue declarations.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError},
+    time::Duration,
+};
 
 use lapin::{
     BasicProperties, Channel, Confirmation, Connection,
     options::{BasicPublishOptions, ConfirmSelectOptions},
 };
 use queuey_core::{Envelope, Error, QueueConfig, Result};
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, Semaphore, SemaphorePermit};
 use tracing::{debug, warn};
 
 use crate::{
@@ -19,19 +22,62 @@ use crate::{
     topology,
 };
 
+/// A pool of confirm-mode channels, each carrying at most one publish at a
+/// time.
+///
+/// # Why one publish per channel
+///
+/// `lapin` does not key a `basic.return` to the delivery tag that caused it.
+/// Returned messages go onto one queue per channel
+/// (`ReturnedMessages::get_waiting_message` pops the front of a `VecDeque`) and
+/// are attached to whichever pending tag the confirm handler resolves first.
+/// For the `basic.ack(multiple = true)` RabbitMQ routinely sends, "first" means
+/// `HashMap` iteration order over the tags the ack covers.
+///
+/// So with several publishes in flight on one channel, an unroutable publish's
+/// return can be handed to a *different*, perfectly routable publish. That
+/// publish then fails spuriously, which is safe — its caller does not ack
+/// anything — but the unroutable one resolves as a bare `Confirmation::Ack` and
+/// is reported as **success**. [`Delivery::dead_letter`](queuey_core::Delivery)
+/// would then ack an original whose successor went nowhere: a job lost with
+/// nothing logged. That is precisely what `Ok(())` from
+/// [`publish_confirmed`](Publisher::publish_confirmed) promises cannot happen.
+///
+/// A channel with a single outstanding confirm cannot misattribute: there is
+/// one pending tag, so a return can only belong to it. Concurrency is therefore
+/// kept by having several such channels rather than by pipelining one, and the
+/// pool size is the ceiling on publishes in flight
+/// ([`RabbitMqOptions::publish_concurrency`]).
+struct ConfirmChannels {
+    connection: Arc<ConnectionHandle>,
+    /// Channels nobody is publishing on. A `std` lock because it is only
+    /// popped from and pushed to, never held across an `await`, and because a
+    /// [`ChannelLease`] has to hand its channel back from `Drop`.
+    idle: StdMutex<Vec<Channel>>,
+    /// One permit per pooled channel. Holding a permit for the whole
+    /// publish-and-confirm is what bounds both the number of channels that can
+    /// exist and the number of confirms in flight.
+    permits: Semaphore,
+    /// The permit count, because a [`Semaphore`] cannot be asked for it and
+    /// [`ConfirmChannels::close`] has to take all of them.
+    size: u32,
+}
+
 /// A cheap, cloneable handle to the publishing channels.
 ///
-/// A single channel in confirm mode is shared by the backend and by every
-/// in-flight [`RabbitMqDelivery`](crate::RabbitMqDelivery), because a delivery
-/// must be able to re-publish (retry / dead-letter) long after the call that
-/// produced it returned. The mutex is only held while the frames are written,
-/// never while waiting for the broker's confirmation, so concurrent publishers
-/// pipeline rather than serialise.
+/// The confirm channels are a small pool (see [`ConfirmChannels`]) shared by
+/// the backend and by every in-flight
+/// [`RabbitMqDelivery`](crate::RabbitMqDelivery), because a delivery must be
+/// able to re-publish (retry / dead-letter) long after the call that produced
+/// it returned. A publish holds one channel of the pool for its whole
+/// publish-and-confirm; concurrent publishers use the other channels, and queue
+/// once the pool is busy.
 ///
 /// A channel exception (an unroutable `mandatory` publish is *not* one, but a
-/// failed declaration or a broker-side error is) closes the channel for good.
-/// The connection is kept so the channel can be reopened lazily on the next
-/// publish; see [`Publisher::publish_confirmed`].
+/// failed declaration or a broker-side error is) closes a channel for good, and
+/// a dropped connection closes all of them. The connection is kept so a channel
+/// can be reopened lazily on the next publish; see
+/// [`ConfirmChannels::acquire`].
 ///
 /// # Why declarations get their own channel
 ///
@@ -39,19 +85,18 @@ use crate::{
 /// it can publish into it, and a declaration is exactly the thing that can be
 /// *refused*: a hold queue that already exists with different arguments is
 /// answered with `PRECONDITION_FAILED`, which kills the channel it was issued
-/// on. On the shared confirm channel that would take down every concurrent
+/// on. On a shared confirm channel that would take down every concurrent
 /// publish with it (a dead-letter, an unrelated enqueue), and the declare's
-/// round trip would have to be waited out under the publish mutex, serialising
-/// publishers for the duration.
+/// round trip would have to be waited out while holding that channel.
 ///
-/// So declarations run on a second, non-confirm channel with its own mutex.
+/// So declarations run on a separate, non-confirm channel with its own mutex.
 /// A refused declaration then costs exactly the one retry or deferral that
-/// asked for it; the confirm channel never notices. Both channels are reopened
-/// lazily when the broker has closed them.
+/// asked for it; the confirm pool never notices. Everything is reopened lazily
+/// when the broker has closed it.
 #[derive(Clone)]
 pub(crate) struct Publisher {
     connection: Arc<ConnectionHandle>,
-    channel: Arc<Mutex<Channel>>,
+    channels: Arc<ConfirmChannels>,
     /// Channel used only for the on-demand hold queue declarations. Not in
     /// confirm mode: nothing is published on it, and a declaration is
     /// synchronous already.
@@ -65,18 +110,161 @@ impl std::fmt::Debug for Publisher {
     }
 }
 
+impl ConfirmChannels {
+    /// A pool of `size` channels, seeded with the one the backend opened while
+    /// connecting.
+    ///
+    /// Seeding rather than opening `size` channels up front keeps a process
+    /// that only ever enqueues from paying for concurrency it never uses: the
+    /// rest are opened the first time that many publishes actually overlap.
+    fn new(connection: Arc<ConnectionHandle>, seed: Channel, size: u32) -> Self {
+        Self {
+            connection,
+            idle: StdMutex::new(vec![seed]),
+            permits: Semaphore::new(size as usize),
+            size,
+        }
+    }
+
+    /// Lock the idle list, ignoring poisoning.
+    ///
+    /// It holds channel handles with no invariants to break, so a panic in
+    /// another thread while it was locked is no reason to stop publishing.
+    fn lock_idle(&self) -> StdMutexGuard<'_, Vec<Channel>> {
+        self.idle.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Take a channel out of the pool for exactly one publish.
+    ///
+    /// Waits for a permit once the pool is fully busy, which is the bound this
+    /// type exists to impose; see [`RabbitMqOptions::publish_concurrency`].
+    ///
+    /// A channel exception closes a channel permanently and a dropped
+    /// connection closes all of them, so a dead channel is replaced here rather
+    /// than handed out: one bad operation, or one outage, must not disable
+    /// publishing for the process. When the *connection* is what died, the
+    /// replacement is opened on a reconnected one, so a publish issued during
+    /// an outage waits for the broker to come back instead of failing. That
+    /// wait happens while holding a permit but no lock, so publishers queue
+    /// behind the one single-flight reconnect in
+    /// [`ConnectionHandle::ensure_connected`] rather than each demanding their
+    /// own.
+    async fn acquire(&self, context: &str) -> Result<ChannelLease<'_>> {
+        let permit = self
+            .permits
+            .acquire()
+            .await
+            // Only reachable once `close` has taken the pool down for good, at
+            // which point "the backend is closed" is exactly the right answer.
+            .map_err(|_| RabbitMqError::Closed.into_core())?;
+
+        // Bound in its own statement so the lock is released before the
+        // `ensure_connected` below: an outage must not pile every publisher up
+        // on the idle list.
+        let pooled = self.lock_idle().pop();
+        let channel = match pooled {
+            Some(channel) if channel.status().connected() => channel,
+            pooled => {
+                if let Some(dead) = pooled {
+                    warn!(
+                        queue = context,
+                        channel = dead.id(),
+                        "publishing channel is closed; opening a replacement in confirm mode"
+                    );
+                }
+                let connection = self.connection.ensure_connected().await?;
+                Publisher::open_confirm_channel(&connection).await?
+            }
+        };
+
+        Ok(ChannelLease {
+            channels: self,
+            channel: Some(channel),
+            _permit: permit,
+        })
+    }
+
+    /// Wait for every in-flight publish to finish, then close every channel.
+    ///
+    /// Taking all the permits is what makes this wait: a publish holds one for
+    /// its whole publish-and-confirm, so `close` cannot pull a channel out from
+    /// under a message that has been written but not yet confirmed. Closing the
+    /// semaphore afterwards makes later publishes fail with
+    /// [`RabbitMqError::Closed`] instead of quietly opening a fresh channel on
+    /// a connection that is going away.
+    ///
+    /// Idempotent: a second call finds the semaphore closed, takes no permits,
+    /// and has no channels left to close. Every channel is attempted even if
+    /// one fails, so a stuck channel cannot leak the others; the first error is
+    /// what is reported.
+    async fn close(&self) -> Result<()> {
+        let permits = self.permits.acquire_many(self.size).await.ok();
+        self.permits.close();
+
+        let channels = std::mem::take(&mut *self.lock_idle());
+        let mut result = Ok(());
+        for channel in &channels {
+            let closed = close_channel(channel).await;
+            if result.is_ok() {
+                result = closed;
+            }
+        }
+        drop(permits);
+        result
+    }
+}
+
+/// One pooled channel, exclusive to a single publish for as long as this lives.
+///
+/// Holding it across the confirmation is the whole point: a channel with one
+/// outstanding confirm cannot be handed a `basic.return` that belongs to some
+/// other publish. See [`ConfirmChannels`].
+///
+/// The channel goes back into the pool when the lease drops, dead or alive.
+/// Diagnosing it here would duplicate what the next
+/// [`acquire`](ConfirmChannels::acquire) does anyway, and returning it
+/// unconditionally is what keeps a failed publish from shrinking the pool.
+struct ChannelLease<'a> {
+    channels: &'a ConfirmChannels,
+    /// Always `Some` until `Drop` takes it back.
+    channel: Option<Channel>,
+    /// Released with the lease. This is the permit that bounds the pool, so it
+    /// must outlive the confirmation, not just the publish.
+    _permit: SemaphorePermit<'a>,
+}
+
+impl ChannelLease<'_> {
+    fn channel(&self) -> &Channel {
+        self.channel
+            .as_ref()
+            .expect("the channel is only taken out in Drop")
+    }
+}
+
+impl Drop for ChannelLease<'_> {
+    fn drop(&mut self) {
+        if let Some(channel) = self.channel.take() {
+            self.channels.lock_idle().push(channel);
+        }
+    }
+}
+
 impl Publisher {
     /// Wrap an already-opened confirm-mode `channel` plus a plain
     /// `declare_channel` for hold queue declarations.
+    ///
+    /// `channel` seeds the confirm pool, whose size comes from
+    /// [`RabbitMqOptions::publish_concurrency`].
     pub(crate) fn new(
         connection: Arc<ConnectionHandle>,
         channel: Channel,
         declare_channel: Channel,
         options: Arc<RabbitMqOptions>,
     ) -> Self {
+        let size = pool_size(&options);
         Self {
+            channels: Arc::new(ConfirmChannels::new(Arc::clone(&connection), channel, size)),
             connection,
-            channel: Arc::new(Mutex::new(channel)),
             declare_channel: Arc::new(Mutex::new(declare_channel)),
             options,
         }
@@ -126,51 +314,14 @@ impl Publisher {
         topology::deferred_queue_name(queue, &self.options.deferred_suffix, ttl_ms)
     }
 
-    /// Lock the shared channel, reopening it first if it has died.
-    ///
-    /// A channel exception (a broker-side error) closes the channel permanently,
-    /// and every user of this publisher would then fail for ever. Reopening
-    /// lazily on the next publish keeps one bad operation from disabling the
-    /// process.
-    ///
-    /// Nothing is *declared* on this channel (see
-    /// [`with_declare_channel`](Publisher::with_declare_channel)), so the one
-    /// operation the broker routinely refuses cannot close it. An unroutable
-    /// `mandatory` publish is not a channel exception either.
-    ///
-    /// When the *connection* is what died, the replacement channel is opened on
-    /// a reconnected one, so a publish issued during an outage waits for the
-    /// broker to come back instead of failing. The wait happens under this
-    /// mutex, which is what makes concurrent publishers queue behind one
-    /// reconnect rather than each demanding their own.
-    ///
-    /// The caller decides how long to hold the guard: [`publish_confirmed`] lets
-    /// go before awaiting the broker's confirmation, so publishers pipeline.
-    ///
-    /// [`publish_confirmed`]: Publisher::publish_confirmed
-    async fn with_channel(&self, context: &str) -> Result<MutexGuard<'_, Channel>> {
-        let mut channel = self.channel.lock().await;
-        if !channel.status().connected() {
-            warn!(
-                queue = context,
-                channel = channel.id(),
-                "publishing channel is closed; opening a replacement in confirm mode"
-            );
-            let connection = self.connection.ensure_connected().await?;
-            *channel = Self::open_confirm_channel(&connection).await?;
-        }
-        Ok(channel)
-    }
-
     /// Lock the declaration channel, reopening it first if it has died.
     ///
-    /// Separate from the publishing channel on purpose: redeclaring a hold queue
-    /// whose arguments differ from the existing one's is answered with
-    /// `PRECONDITION_FAILED`, which closes the channel. Doing that on the shared
-    /// confirm channel would fail every publish in flight on it, and the
-    /// declare's round trip would be waited out under the publish mutex. Here it
-    /// costs only the retry or deferral that asked for it, plus one reopened
-    /// channel.
+    /// Separate from the publishing channels on purpose: redeclaring a hold
+    /// queue whose arguments differ from the existing one's is answered with
+    /// `PRECONDITION_FAILED`, which closes the channel. Doing that on a confirm
+    /// channel would fail whatever publish was in flight on it, and the
+    /// declare's round trip would be waited out while holding it. Here it costs
+    /// only the retry or deferral that asked for it, plus one reopened channel.
     async fn with_declare_channel(&self, context: &str) -> Result<MutexGuard<'_, Channel>> {
         let mut channel = self.declare_channel.lock().await;
         if !channel.status().connected() {
@@ -194,9 +345,15 @@ impl Publisher {
     /// therefore treat `Ok(())` as "durably handed over to a real queue", which
     /// is what makes it safe for a delivery to ack the original afterwards.
     ///
-    /// If the shared channel has died (a channel exception closes it
-    /// permanently) a new confirm-mode channel is opened and swapped in first,
-    /// so one bad operation does not disable publishing for the process.
+    /// The channel is taken from the confirm pool and held for the whole
+    /// publish *and* confirmation, so the broker's `basic.return` can only
+    /// belong to this publish. Overlapping publishes go on other channels of
+    /// the pool; the pool size is the ceiling on how many overlap at once. See
+    /// [`ConfirmChannels`] for why pipelining one channel silently loses jobs.
+    ///
+    /// A channel that has died (a channel exception closes it permanently, and
+    /// a dropped connection closes all of them) is replaced on checkout, so one
+    /// bad operation does not disable publishing for the process.
     pub(crate) async fn publish_confirmed(
         &self,
         queue: &str,
@@ -205,9 +362,10 @@ impl Publisher {
     ) -> Result<()> {
         let routing_key = short_string(queue)?;
 
-        let confirm = {
-            let channel = self.with_channel(queue).await?;
-            channel
+        let confirmation = {
+            let lease = self.channels.acquire(queue).await?;
+            let confirm = lease
+                .channel()
                 .basic_publish(
                     // The default exchange routes by queue name.
                     "".into(),
@@ -221,12 +379,14 @@ impl Publisher {
                     properties,
                 )
                 .await
-                .map_err(amqp)?
-            // The guard is dropped here: the confirmation is awaited without
-            // blocking other publishers.
+                .map_err(amqp)?;
+            // Awaited while the lease is still held. This channel has exactly
+            // one publish outstanding, which is what lets a `basic.return` be
+            // attributed to it and to nothing else.
+            confirm.await.map_err(amqp)?
         };
 
-        confirmation_to_result(confirm.await.map_err(amqp)?, queue)?;
+        confirmation_to_result(confirmation, queue)?;
         debug!(queue, bytes = payload.len(), "publish confirmed");
         Ok(())
     }
@@ -355,23 +515,31 @@ impl Publisher {
         self.publish_confirmed(&target, payload, properties).await
     }
 
-    /// Close both channels, whichever of them are still open.
+    /// Close every channel, whichever of them are still open.
     ///
-    /// Does *not* reopen them first: closing a dead channel is
-    /// already the state the caller wanted. Both are attempted even if the first
-    /// fails, so a stuck publishing channel cannot leak the declaration one; the
-    /// first error is what is reported.
+    /// Does *not* reopen them first: closing a dead channel is already the
+    /// state the caller wanted. The declaration channel is attempted even if
+    /// the confirm pool failed, so a stuck publish cannot leak it; the first
+    /// error is what is reported.
     pub(crate) async fn close(&self) -> Result<()> {
-        let publishing = {
-            let channel = self.channel.lock().await;
-            close_channel(&channel).await
-        };
+        let publishing = self.channels.close().await;
         let declaring = {
             let channel = self.declare_channel.lock().await;
             close_channel(&channel).await
         };
         publishing.and(declaring)
     }
+}
+
+/// How many confirm channels this configuration asks for, as a permit count.
+///
+/// Clamped rather than validated, like the granularities: this comes from a
+/// builder, and library code does not panic on configuration. Zero would mean
+/// "no publishing at all", which nobody can have meant.
+fn pool_size(options: &RabbitMqOptions) -> u32 {
+    u32::try_from(options.publish_concurrency)
+        .unwrap_or(u32::MAX)
+        .max(1)
 }
 
 /// Why a message is being put into a hold queue.
@@ -476,6 +644,28 @@ mod tests {
             Hold::Deferral.granularity(&options),
             Duration::from_millis(250)
         );
+    }
+
+    #[test]
+    fn the_confirm_pool_never_shrinks_below_one_channel() {
+        // A builder must not panic on a configuration value, and a pool of
+        // zero would mean a backend that cannot publish at all.
+        let options = RabbitMqOptions::default().publish_concurrency(0);
+        assert_eq!(pool_size(&options), 1);
+    }
+
+    #[test]
+    fn the_confirm_pool_follows_the_configured_concurrency() {
+        let options = RabbitMqOptions::default().publish_concurrency(32);
+        assert_eq!(pool_size(&options), 32);
+    }
+
+    #[test]
+    fn an_absurd_confirm_pool_is_capped_rather_than_overflowing() {
+        // `usize` is wider than the permit count a semaphore is asked for, and
+        // saturating beats wrapping to something small and surprising.
+        let options = RabbitMqOptions::default().publish_concurrency(usize::MAX);
+        assert_eq!(pool_size(&options), u32::MAX);
     }
 
     #[test]

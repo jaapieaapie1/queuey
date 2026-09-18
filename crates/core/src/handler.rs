@@ -5,7 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::{error::JobError, job::Job, retry::RetryPolicy};
+use crate::{error::JobError, job::Job, queue::QueueSet, retry::RetryPolicy};
 
 /// Metadata about the current execution, available to handlers.
 #[derive(Debug, Clone)]
@@ -37,6 +37,98 @@ pub struct JobContext {
 }
 
 impl JobContext {
+    /// A context for `J` on its `attempt`-th of `max_attempts` tries.
+    ///
+    /// The worker builds these from the envelope it just decoded. They are
+    /// public because this type is `#[non_exhaustive]`, and without a
+    /// constructor the only way to get one is to stand up a [`MemoryBackend`]
+    /// and a [`Worker`] and drive a real delivery through them — a lot of
+    /// machinery for a test of a handler's own branching on `attempt`,
+    /// `deferrals` or `age`.
+    ///
+    /// The four arguments are the ones with no defensible default; everything
+    /// else starts neutral (a fresh `job_id`, zero deferrals, priority `0`, zero
+    /// age, no correlation id) and is set by the builders below, so a test only
+    /// spells out what it is actually asserting on. `job_type` and `queue` come
+    /// from `J` rather than being passed, because the worker cannot get them
+    /// wrong either.
+    ///
+    /// ```
+    /// # use queuey_core::{Job, JobContext, QueueConfig, QueueSet};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    /// # enum Q { Emails }
+    /// # impl QueueSet for Q {
+    /// #     fn all() -> &'static [Self] { &[Q::Emails] }
+    /// #     fn name(&self) -> &'static str { "emails" }
+    /// #     fn config(&self) -> QueueConfig { QueueConfig::new("emails") }
+    /// # }
+    /// # #[derive(Serialize, Deserialize)]
+    /// # struct SendEmail;
+    /// # impl Job for SendEmail {
+    /// #     type Queue = Q;
+    /// #     const NAME: &'static str = "SendEmail";
+    /// #     const QUEUE: Q = Q::Emails;
+    /// # }
+    /// // The last attempt of three, having been deferred twice already.
+    /// let ctx = JobContext::new::<SendEmail>(3, 3).with_deferrals(2);
+    /// assert!(ctx.is_last_attempt());
+    /// assert_eq!(ctx.job_type, "SendEmail");
+    /// assert_eq!(ctx.queue, "emails");
+    /// ```
+    ///
+    /// [`MemoryBackend`]: crate::MemoryBackend
+    /// [`Worker`]: crate::Worker
+    #[must_use]
+    pub fn new<J: Job>(attempt: u32, max_attempts: u32) -> Self {
+        Self {
+            job_id: Uuid::new_v4(),
+            job_type: J::NAME,
+            queue: J::QUEUE.name(),
+            attempt,
+            max_attempts,
+            deferrals: 0,
+            priority: 0,
+            age: Duration::ZERO,
+            correlation_id: None,
+        }
+    }
+
+    /// Set the job id, which a real context carries across every attempt.
+    #[must_use]
+    pub fn with_job_id(mut self, job_id: Uuid) -> Self {
+        self.job_id = job_id;
+        self
+    }
+
+    /// Set how often the job was deferred, for a handler that caps deferrals.
+    #[must_use]
+    pub fn with_deferrals(mut self, deferrals: u32) -> Self {
+        self.deferrals = deferrals;
+        self
+    }
+
+    /// Set the broker priority this delivery arrived with.
+    #[must_use]
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Set the time since first enqueue, for a handler that drops stale work.
+    #[must_use]
+    pub fn with_age(mut self, age: Duration) -> Self {
+        self.age = age;
+        self
+    }
+
+    /// Set the correlation id the job was enqueued with.
+    #[must_use]
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<String>) -> Self {
+        self.correlation_id = Some(correlation_id.into());
+        self
+    }
+
     /// Whether a failure now means the job is dead-lettered.
     pub fn is_last_attempt(&self) -> bool {
         self.attempt >= self.max_attempts
@@ -147,5 +239,87 @@ where
 
     async fn handle(&self, job: J, ctx: JobContext) -> Result<(), JobError> {
         (self.f)(job, ctx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{Greet, TestQueues};
+
+    /// The whole point of [`JobContext::new`]: a handler whose behaviour depends
+    /// on the context is testable by calling it, with no backend, no worker and
+    /// no delivery in sight.
+    struct GiveUpWhenStale;
+
+    #[async_trait]
+    impl JobHandler for GiveUpWhenStale {
+        type Job = Greet;
+
+        async fn handle(&self, _job: Greet, ctx: JobContext) -> Result<(), JobError> {
+            if ctx.deferrals >= 3 {
+                return Err(JobError::fatal_msg("deferred too often"));
+            }
+            if ctx.age > Duration::from_secs(60) {
+                return Err(JobError::fatal_msg("too old to be worth sending"));
+            }
+            Err(JobError::deferred(Duration::from_secs(30)))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_handler_is_testable_without_a_backend() {
+        let handler = GiveUpWhenStale;
+        let job = Greet::new("world");
+
+        let fresh = JobContext::new::<Greet>(1, 3);
+        assert!(matches!(
+            handler.handle(job.clone(), fresh).await,
+            Err(JobError::Deferred { .. })
+        ));
+
+        let deferred_out = JobContext::new::<Greet>(1, 3).with_deferrals(3);
+        assert!(matches!(
+            handler.handle(job.clone(), deferred_out).await,
+            Err(JobError::Fatal(_))
+        ));
+
+        let stale = JobContext::new::<Greet>(1, 3).with_age(Duration::from_secs(61));
+        assert!(matches!(
+            handler.handle(job, stale).await,
+            Err(JobError::Fatal(_))
+        ));
+    }
+
+    #[test]
+    fn the_constructor_fills_job_type_and_queue_from_the_job() {
+        let ctx = JobContext::new::<Greet>(2, 5);
+        assert_eq!(ctx.job_type, Greet::NAME);
+        assert_eq!(ctx.queue, TestQueues::Alpha.name());
+        assert_eq!(ctx.attempt, 2);
+        assert_eq!(ctx.max_attempts, 5);
+        assert!(!ctx.is_last_attempt());
+        // Everything optional starts neutral.
+        assert_eq!(ctx.deferrals, 0);
+        assert_eq!(ctx.priority, 0);
+        assert_eq!(ctx.age, Duration::ZERO);
+        assert_eq!(ctx.correlation_id, None);
+    }
+
+    #[test]
+    fn the_builders_set_exactly_what_they_name() {
+        let id = Uuid::new_v4();
+        let ctx = JobContext::new::<Greet>(3, 3)
+            .with_job_id(id)
+            .with_deferrals(7)
+            .with_priority(10)
+            .with_age(Duration::from_secs(90))
+            .with_correlation_id("req-42");
+        assert_eq!(ctx.job_id, id);
+        assert_eq!(ctx.deferrals, 7);
+        assert_eq!(ctx.priority, 10);
+        assert_eq!(ctx.age, Duration::from_secs(90));
+        assert_eq!(ctx.correlation_id.as_deref(), Some("req-42"));
+        assert!(ctx.is_last_attempt());
     }
 }

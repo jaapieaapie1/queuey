@@ -14,13 +14,13 @@ use crate::topology::{
 };
 
 /// `content-type` set on every published message.
-pub const CONTENT_TYPE_JSON: &str = "application/json";
+pub(crate) const CONTENT_TYPE_JSON: &str = "application/json";
 
 /// `delivery-mode` for a persistent message.
-pub const DELIVERY_MODE_PERSISTENT: u8 = 2;
+pub(crate) const DELIVERY_MODE_PERSISTENT: u8 = 2;
 
 /// Reason recorded on bodies that could not be decoded as an [`Envelope`].
-pub const REASON_MALFORMED: &str = "malformed envelope";
+pub(crate) const REASON_MALFORMED: &str = "malformed envelope";
 
 /// Headers carried by every published envelope.
 ///
@@ -29,7 +29,7 @@ pub const REASON_MALFORMED: &str = "malformed envelope";
 /// management UI without decoding the body. The body stays the source of truth:
 /// nothing in this crate reads these back.
 #[must_use]
-pub fn base_headers(envelope: &Envelope) -> FieldTable {
+pub(crate) fn base_headers(envelope: &Envelope) -> FieldTable {
     let mut headers = FieldTable::default();
     headers.insert(HEADER_ATTEMPT.into(), AMQPValue::LongUInt(envelope.attempt));
     headers.insert(
@@ -56,7 +56,7 @@ pub fn base_headers(envelope: &Envelope) -> FieldTable {
 ///   mixed-TTL head-of-line blocking that hold queues exist to avoid, and a
 ///   shorter one would release the job early.
 #[must_use]
-pub fn props_for(envelope: &Envelope) -> BasicProperties {
+pub(crate) fn props_for(envelope: &Envelope) -> BasicProperties {
     BasicProperties::default()
         .with_content_type(CONTENT_TYPE_JSON.into())
         .with_delivery_mode(DELIVERY_MODE_PERSISTENT)
@@ -71,7 +71,7 @@ pub fn props_for(envelope: &Envelope) -> BasicProperties {
 /// Extends [`base_headers`] with `x-death-reason`, `x-original-queue` and
 /// `x-attempts`.
 #[must_use]
-pub fn dead_letter_headers(envelope: &Envelope, reason: &str) -> FieldTable {
+pub(crate) fn dead_letter_headers(envelope: &Envelope, reason: &str) -> FieldTable {
     let mut headers = base_headers(envelope);
     headers.insert(
         HEADER_DEATH_REASON.into(),
@@ -90,7 +90,7 @@ pub fn dead_letter_headers(envelope: &Envelope, reason: &str) -> FieldTable {
 
 /// AMQP properties for publishing `envelope` to its dead-letter queue.
 #[must_use]
-pub fn dead_letter_props(envelope: &Envelope, reason: &str) -> BasicProperties {
+pub(crate) fn dead_letter_props(envelope: &Envelope, reason: &str) -> BasicProperties {
     props_for(envelope).with_headers(dead_letter_headers(envelope, reason))
 }
 
@@ -99,7 +99,7 @@ pub fn dead_letter_props(envelope: &Envelope, reason: &str) -> BasicProperties {
 /// The original bytes are forwarded verbatim, so there is no attempt counter and
 /// no job metadata to carry, only where it came from and why it was rejected.
 #[must_use]
-pub fn malformed_props(original_queue: &str, reason: &str) -> BasicProperties {
+pub(crate) fn malformed_props(original_queue: &str, reason: &str) -> BasicProperties {
     let mut headers = FieldTable::default();
     headers.insert(
         HEADER_DEATH_REASON.into(),

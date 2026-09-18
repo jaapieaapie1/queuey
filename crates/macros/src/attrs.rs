@@ -50,6 +50,41 @@ pub(crate) fn set_once<T>(
     Ok(())
 }
 
+/// Move a recorded key's span onto the literal it was parsed from.
+///
+/// [`set_once`] spans on the key, which is what a "duplicate key" error wants to
+/// point at; a rejected *value* wants the literal instead.
+pub(crate) fn respan<T>(slot: &mut Option<Keyed<T>>, span: Span) {
+    if let Some(keyed) = slot.as_mut() {
+        keyed.span = span;
+    }
+}
+
+/// Reject a string literal that is empty or nothing but whitespace.
+///
+/// Both end up in the wire format: a queue name goes onto the broker, a job name
+/// into every envelope's `job_type` and into the worker's handler-dispatch key.
+/// `""` is obviously a mistake; `"   "` is the same mistake wearing a disguise,
+/// and it produces a queue an operator cannot name in a management UI or a
+/// `rabbitmqctl` argument. Neither is worth freezing into a 1.0 grammar, so both
+/// are rejected, spanned at the literal.
+pub(crate) fn reject_blank(lit: &LitStr, key: &str) -> syn::Result<()> {
+    let value = lit.value();
+    if value.is_empty() {
+        return Err(syn::Error::new(
+            lit.span(),
+            format!("`{key}` must not be empty"),
+        ));
+    }
+    if value.trim().is_empty() {
+        return Err(syn::Error::new(
+            lit.span(),
+            format!("`{key}` must not be only whitespace"),
+        ));
+    }
+    Ok(())
+}
+
 /// Human readable name of an attribute key.
 pub(crate) fn key_name(path: &Path) -> String {
     match path.get_ident() {
@@ -104,6 +139,23 @@ where
     lit.base10_parse::<T>()
         .map_err(|_| syn::Error::new(lit.span(), format!("`{key}` must be an integer {range}")))
 }
+
+/// Largest `message_ttl` a broker can be asked for, in milliseconds.
+///
+/// RabbitMQ parses `x-message-ttl` as an *unsigned 32-bit* millisecond count
+/// (`queuey_rabbitmq::topology::MAX_TTL_MS`), and `crates/rabbitmq`'s
+/// `queue_args` clamps to it rather than letting a `PRECONDITION_FAILED` close
+/// the declaring channel. A clamp is the wrong answer for a value written in
+/// source, where the mistake can simply be pointed at, so the derives reject it
+/// here instead. This is *not* `MAX_DEFERRAL_MS`, which is half as large and
+/// bounds a hold queue's delay, not a queue's message TTL.
+///
+/// Duplicated rather than imported: `queuey-macros` must not depend on a
+/// backend crate.
+pub(crate) const MAX_MESSAGE_TTL_MS: u64 = u32::MAX as u64;
+
+/// Accepted range of `message_ttl`, shared by the check and its error message.
+pub(crate) const MESSAGE_TTL_RANGE: &str = "between \"1ms\" and \"4294967295ms\" (~49.7 days)";
 
 /// Accepted range of `prefetch`, shared by the parser and its error message.
 pub(crate) const PREFETCH_RANGE: &str = "between 1 and 65535";
@@ -171,38 +223,106 @@ const FACADE_PACKAGE: &str = "queuey";
 /// Package name of the core crate itself.
 const CORE_PACKAGE: &str = "queuey-core";
 
-/// The default path to the core crate, resolved against the *user's* manifest.
+/// What the manifest says about one of the two crates.
 ///
-/// Resolution order, so that depending on either crate alone just works:
-///
-/// 1. `queuey` (the facade): emits `::queuey::__core`, honouring
-///    a `package = ` rename of the dependency.
-/// 2. `queuey-core`: emits `::queuey_core`, again honouring a rename.
-/// 3. Neither found (no manifest, a vendored tree, ...): falls back to
-///    `::queuey_core`.
-///
-/// An explicit `crate = "..."` in the attribute always wins over all of this.
-pub(crate) fn default_crate_path() -> Path {
-    resolved_crate_path().unwrap_or_else(|| syn::parse_quote!(::queuey_core))
+/// `proc-macro-crate`'s own error type answers "why did the lookup fail" in more
+/// detail than the decision needs, and cannot be constructed in a test. Reducing
+/// it to these four cases keeps [`choose_crate_path`] a pure function of the
+/// manifest, which is what the precedence tests drive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Lookup {
+    /// The crate being compiled *is* this package.
+    Itself,
+    /// The package is a dependency, linked under this name (a `package = `
+    /// rename is already applied).
+    Named(String),
+    /// The manifest was read and simply does not mention the package.
+    Absent,
+    /// There was no manifest to read: not a cargo build, a vendored tree, ...
+    NoManifest,
 }
 
-fn resolved_crate_path() -> Option<Path> {
-    // The facade first: a crate depending on both should still go through it, and a
-    // crate depending only on the facade cannot name the core crate at all.
-    if let Ok(found) = proc_macro_crate::crate_name(FACADE_PACKAGE) {
-        let facade = match found {
-            // `Itself` means we are expanding inside the facade's own lib, examples or
-            // doctests; `extern crate self as queuey;` makes this path resolve
-            // there too.
-            proc_macro_crate::FoundCrate::Itself => "queuey".to_owned(),
-            proc_macro_crate::FoundCrate::Name(name) => name,
-        };
-        return syn::parse_str(&format!("::{facade}::__core")).ok();
+impl From<Result<proc_macro_crate::FoundCrate, proc_macro_crate::Error>> for Lookup {
+    fn from(found: Result<proc_macro_crate::FoundCrate, proc_macro_crate::Error>) -> Self {
+        match found {
+            Ok(proc_macro_crate::FoundCrate::Itself) => Lookup::Itself,
+            Ok(proc_macro_crate::FoundCrate::Name(name)) => Lookup::Named(name),
+            Err(proc_macro_crate::Error::CrateNotFound { .. }) => Lookup::Absent,
+            Err(_) => Lookup::NoManifest,
+        }
     }
-    match proc_macro_crate::crate_name(CORE_PACKAGE) {
-        Ok(proc_macro_crate::FoundCrate::Itself) => syn::parse_str("crate").ok(),
-        Ok(proc_macro_crate::FoundCrate::Name(name)) => syn::parse_str(&format!("::{name}")).ok(),
-        Err(_) => None,
+}
+
+/// The default path to the core crate, resolved against the *user's* manifest.
+///
+/// `proc-macro-crate` reads a manifest, not a build graph: it merges
+/// `[dependencies]` with `[dev-dependencies]` and cannot know which target is
+/// being compiled. So "the facade is mentioned" does not mean the facade is
+/// linked into the crate that is expanding this derive — it is not, when the
+/// facade is a dev-dependency or an `optional` dependency whose feature is off.
+/// Resolving the *core* crate first is what makes those manifests work:
+/// whenever `queuey-core` is mentioned at all, `::queuey_core` names the same
+/// items as `::queuey::__core` (the facade only re-exports it), so the core path
+/// is never worse and is right in strictly more places.
+///
+/// Resolution order:
+///
+/// 1. The facade compiling *itself*: `::queuey::__core`, which
+///    `extern crate self as queuey;` makes resolve. This keeps the facade's own
+///    doctests, examples and tests on exactly the path a facade-only user gets,
+///    which is the only place that path is exercised in this workspace.
+/// 2. `queuey-core` in the manifest: `::queuey_core`, honouring a rename, or
+///    `crate` when the core crate is compiling itself.
+/// 3. `queuey` in the manifest: `::queuey::__core`, again honouring a rename.
+/// 4. Neither, with a readable manifest: a compile error naming the
+///    `crate = "..."` escape hatch, because the alternative is rustc
+///    complaining about a crate the user never wrote down.
+/// 5. No manifest at all: `::queuey_core`, rather than failing a build that
+///    cargo never described. A non-cargo build system passing `--extern` itself
+///    keeps working.
+///
+/// An explicit `crate = "..."` in the attribute always wins over all of this.
+pub(crate) fn default_crate_path(span: Span, attr: &str) -> syn::Result<Path> {
+    let facade = Lookup::from(proc_macro_crate::crate_name(FACADE_PACKAGE));
+    let core = Lookup::from(proc_macro_crate::crate_name(CORE_PACKAGE));
+    let chosen = choose_crate_path(&facade, &core).ok_or_else(|| {
+        syn::Error::new(
+            span,
+            format!(
+                "cannot find `{FACADE_PACKAGE}` or `{CORE_PACKAGE}` in the dependencies of this \
+                 crate; add one of them, or name the core crate explicitly with \
+                 `#[{attr}(crate = \"...\")]`"
+            ),
+        )
+    })?;
+    syn::parse_str(&chosen).map_err(|_| {
+        syn::Error::new(
+            span,
+            format!(
+                "`{chosen}` is not a usable path to `{CORE_PACKAGE}`; name it explicitly with \
+                 `#[{attr}(crate = \"...\")]`"
+            ),
+        )
+    })
+}
+
+/// The precedence table of [`default_crate_path`], as a pure function.
+///
+/// `None` means "both crates are absent from a manifest we could read", the one
+/// case worth a diagnostic of our own.
+pub(crate) fn choose_crate_path(facade: &Lookup, core: &Lookup) -> Option<String> {
+    match (facade, core) {
+        // Inside the facade itself, before anything else: `queuey-core` is one of
+        // its own dependencies, so rule 2 would otherwise quietly take over and
+        // this workspace would stop compiling `::queuey::__core` anywhere.
+        (Lookup::Itself, _) => Some(format!("::{FACADE_PACKAGE}::__core")),
+        (_, Lookup::Itself) => Some("crate".to_owned()),
+        (_, Lookup::Named(name)) => Some(format!("::{name}")),
+        (Lookup::Named(name), _) => Some(format!("::{name}::__core")),
+        // Neither is named, but the manifest was unreadable rather than silent:
+        // guess the conventional name instead of failing the build.
+        (Lookup::NoManifest, _) | (_, Lookup::NoManifest) => Some("::queuey_core".to_owned()),
+        (Lookup::Absent, Lookup::Absent) => None,
     }
 }
 
@@ -247,13 +367,12 @@ impl RetrySpec {
                 let base = duration::to_tokens(*base_ms);
                 let max = duration::to_tokens(*max_ms);
                 let factor = LitFloat::new(&format!("{factor:?}f64"), Span::call_site());
+                // `Backoff::Exponential` is `#[non_exhaustive]`, so the struct
+                // literal this used to emit would not compile in the user's
+                // crate. The constructor is the supported spelling and stays
+                // valid when the variant gains a field.
                 quote! {
-                    #core::Backoff::Exponential {
-                        base: #base,
-                        factor: #factor,
-                        max: #max,
-                        jitter: #jitter,
-                    }
+                    #core::Backoff::exponential_with(#base, #factor, #max, #jitter)
                 }
             }
         };
@@ -642,7 +761,7 @@ mod tests {
 
     #[test]
     fn renders_policy_tokens() {
-        let core = default_crate_path();
+        let core = default_crate_path(Span::call_site(), "job").unwrap();
         let spec = RetrySpec {
             max_attempts: 4,
             backoff: BackoffSpec::Exponential {
@@ -654,7 +773,14 @@ mod tests {
         };
         let rendered = spec.to_tokens(&core).to_string();
         assert!(rendered.contains("RetryPolicy :: new (4u32"), "{rendered}");
-        assert!(rendered.contains("factor : 2.0f64"), "{rendered}");
+        // The constructor, never the struct literal: `Backoff::Exponential` is
+        // `#[non_exhaustive]` and a literal would not compile downstream.
+        assert!(
+            rendered.contains("Backoff :: exponential_with ("),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Backoff :: Exponential {"), "{rendered}");
+        assert!(rendered.contains("2.0f64"), "{rendered}");
         assert!(rendered.contains("from_millis (300000u64)"), "{rendered}");
 
         let fixed = RetrySpec {
@@ -698,7 +824,65 @@ mod tests {
 
     #[test]
     fn default_core_path() {
-        let path = default_crate_path();
+        // Resolved against this crate's own manifest, which dev-depends on
+        // `queuey-core` and not on the facade.
+        let path = default_crate_path(Span::call_site(), "job").unwrap();
         assert_eq!(quote!(#path).to_string(), ":: queuey_core");
+    }
+
+    /// The precedence table of [`default_crate_path`], one case per manifest
+    /// shape. The second case is the regression: a crate that depends on
+    /// `queuey-core` for its lib and on the facade only for its tests used to
+    /// be handed `::queuey::__core`, which its lib cannot resolve, because
+    /// `proc-macro-crate` reads `[dev-dependencies]` too and cannot say which
+    /// target is compiling.
+    #[test]
+    fn crate_path_precedence() {
+        let named = |name: &str| Lookup::Named(name.to_owned());
+
+        // Facade only: the only path such a crate can name.
+        assert_eq!(
+            choose_crate_path(&named("queuey"), &Lookup::Absent).as_deref(),
+            Some("::queuey::__core")
+        );
+        // Both named, whatever the section: the core path resolves either way.
+        assert_eq!(
+            choose_crate_path(&named("queuey"), &named("queuey_core")).as_deref(),
+            Some("::queuey_core")
+        );
+        // Core only.
+        assert_eq!(
+            choose_crate_path(&Lookup::Absent, &named("queuey_core")).as_deref(),
+            Some("::queuey_core")
+        );
+        // Renames are honoured on both paths.
+        assert_eq!(
+            choose_crate_path(&named("my_queuey"), &Lookup::Absent).as_deref(),
+            Some("::my_queuey::__core")
+        );
+        assert_eq!(
+            choose_crate_path(&Lookup::Absent, &named("my_core")).as_deref(),
+            Some("::my_core")
+        );
+        // The facade expanding its own doctests and examples must stay on
+        // `::queuey::__core` even though `queuey-core` is one of its deps: this
+        // workspace exercises that path nowhere else.
+        assert_eq!(
+            choose_crate_path(&Lookup::Itself, &named("queuey_core")).as_deref(),
+            Some("::queuey::__core")
+        );
+        // The core crate expanding itself (it does not today, but the path is free).
+        assert_eq!(
+            choose_crate_path(&Lookup::Absent, &Lookup::Itself).as_deref(),
+            Some("crate")
+        );
+        // No manifest to read: guess rather than fail a build cargo never described.
+        assert_eq!(
+            choose_crate_path(&Lookup::NoManifest, &Lookup::NoManifest).as_deref(),
+            Some("::queuey_core")
+        );
+        // Readable manifest, neither crate in it: the caller turns this into a
+        // diagnostic that names `crate = "..."`.
+        assert_eq!(choose_crate_path(&Lookup::Absent, &Lookup::Absent), None);
     }
 }

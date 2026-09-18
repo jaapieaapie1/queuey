@@ -1,4 +1,5 @@
-//! RabbitMQ backend for [`queuey`], built on [`lapin`].
+//! RabbitMQ backend for [`queuey`], built on `lapin` — as an implementation
+//! detail, not as part of this crate's public surface.
 //!
 //! [`RabbitMqBackend`] implements [`queuey_core::Backend`]: it owns one
 //! AMQP connection, publishes with publisher confirms, and hands the worker
@@ -25,6 +26,23 @@
 //! backend.close().await?;
 //! # Ok(()) }
 //! ```
+//!
+//! # `lapin` is an implementation detail
+//!
+//! Nothing public here — no signature, no field, no re-export, no trait impl —
+//! mentions a `lapin` type. That is a deliberate cost: `lapin` went 2 -> 3 -> 4
+//! in short order, and one `lapin` type in this crate's surface would make a
+//! `lapin` 5.0 into a `queuey` 2.0, for the sake of a handful of helpers that
+//! only ever served this backend's own publisher. So the envelope <->
+//! `BasicProperties` mapping and the `FieldTable` declaration arguments are
+//! crate-private, there is no way to borrow the connection or a channel, and the
+//! one handshake detail worth configuring from outside —
+//! [`RabbitMqOptions::connection_name`], which is what puts a readable name in
+//! the management UI — is a plain [`String`] this crate owns and translates.
+//!
+//! The parts of the topology an operator or a cleanup script genuinely needs are
+//! plain strings and stay public: see [`topology`]. An application that also
+//! speaks raw AMQP depends on `lapin` itself and opens its own connection.
 //!
 //! # Topology
 //!
@@ -202,6 +220,7 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(unreachable_pub)]
 
 mod backend;
 mod connection;
@@ -211,7 +230,15 @@ mod options;
 mod publisher;
 mod reconnect;
 
-pub mod codec;
+/// Envelope <-> AMQP property mapping.
+///
+/// Crate-private on purpose: every function in here returns a `lapin`
+/// `BasicProperties` or `FieldTable`, so publishing it would tie this crate's
+/// whole 1.x line to one `lapin` major version for the sake of helpers that
+/// only serve its own publisher. The parts of the topology a downstream
+/// operator actually needs — the queue *names* — are plain strings and stay
+/// public in [`topology`].
+pub(crate) mod codec;
 pub mod topology;
 
 pub use backend::RabbitMqBackend;
@@ -222,7 +249,3 @@ pub use reconnect::{Attempt, BackoffPolicy, Rebuilding, ReconnectPolicy};
 /// Re-export of the backoff curve [`BackoffPolicy`] is built from, so a policy
 /// can be tuned without naming `queuey-core` as a dependency.
 pub use queuey_core::Backoff;
-
-/// Re-export of the `lapin` version this backend is built against, so callers
-/// can name [`lapin::ConnectionProperties`] without pinning it themselves.
-pub use lapin;
