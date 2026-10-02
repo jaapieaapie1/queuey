@@ -150,6 +150,17 @@ pub(crate) enum RabbitMqError {
     /// nobody intends to use again.
     #[error("the rabbitmq backend is closed")]
     Closed,
+
+    /// The URI asks for TLS, but this build has no TLS backend compiled in.
+    ///
+    /// Refused rather than attempted: without a backend the transport under
+    /// `lapin` does not fail an `amqps://` connection, it quietly opens a
+    /// *plaintext* one to the same address, credentials included.
+    #[error(
+        "`amqps://` needs a TLS backend, but queuey-rabbitmq was built without one; \
+         enable its `rustls`, `native-tls` or `openssl` feature"
+    )]
+    TlsUnavailable,
 }
 
 impl RabbitMqError {

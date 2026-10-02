@@ -149,6 +149,47 @@ reactor, and `lapin`'s own `enable_auto_recover` are all deliberately not config
 the first two buy nothing, and the rest would either re-create the version pin or race
 with the reconnection above.
 
+## TLS
+
+`amqps://` needs a TLS backend, picked with this crate's features. The default,
+`rustls`, is what `lapin` itself ships: rustls on aws-lc-rs, trusting the platform's
+certificate store.
+
+| feature | what it adds |
+|---|---|
+| `rustls` (default) | `rustls-aws-lc-rs` + `rustls-platform-verifier` |
+| `rustls-aws-lc-rs` | rustls crypto provider: aws-lc-rs |
+| `rustls-ring` | rustls crypto provider: ring |
+| `rustls-platform-verifier` | rustls trust roots: the OS verifier (Security.framework, SChannel, or the system store on Linux) |
+| `rustls-native-certs` | rustls trust roots: the certificates installed on the system, loaded at connect |
+| `rustls-webpki-roots` | rustls trust roots: Mozilla's roots, compiled into the binary |
+| `native-tls` | the platform TLS library instead of rustls |
+| `openssl` | OpenSSL, linked from the system |
+| `openssl-vendored` | OpenSSL, built from source and linked statically |
+
+A rustls setup needs one crypto provider and one source of trust roots, for
+example `features = ["rustls-ring", "rustls-webpki-roots"]` for a build with no system
+dependencies. A trust-root feature on its own compiles, but then the application has to
+install a process-wide rustls `CryptoProvider` itself before connecting. When more than
+one backend is enabled, rustls wins over OpenSSL, and OpenSSL over `native-tls`.
+
+A service that only speaks `amqp://` can drop TLS altogether:
+
+```toml
+queuey-rabbitmq = { version = "1.1", default-features = false }
+```
+
+That removes rustls, aws-lc-rs and, on macOS, the Security and CoreFoundation frameworks
+from the build. That saves compile time and binary size. On macOS it also cuts about
+5 MB of resident memory per process, most of it the frameworks' shared pages.
+
+**Without a TLS backend, `amqps://` is refused**: `connect` / `with_options` fail
+with an error that names the features to enable. The transport underneath `lapin` would
+otherwise downgrade an `amqps://` URI to a plaintext connection to the same host,
+credentials included. The check looks at this crate's features only, so TLS enabled
+through a direct `lapin` dependency elsewhere in the build does not count: enable it
+here.
+
 ## Topology
 
 For each logical queue `q`:
@@ -325,6 +366,12 @@ let options = RabbitMqOptions::default().publish_concurrency(32);
 ```
 
 ## Upgrading
+
+**TLS is a feature now.** `lapin` is pulled in without its default features and TLS
+comes from this crate's own (see [TLS](#tls)). The default is unchanged, so a plain
+`queuey-rabbitmq = "1"` behaves exactly as before. A build with
+`default-features = false` loses TLS: add `features = ["rustls"]` to keep `amqps://`
+working. Such a build now fails `connect` on an `amqps://` URI instead of dialling it.
 
 **`q.retry` is gone.** Earlier versions declared a `q.retry` wait queue per work
 queue and published retries into it with a per-message `expiration`. Retries

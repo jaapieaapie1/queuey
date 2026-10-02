@@ -11,8 +11,18 @@ categories.workspace = true
 readme = "README.md"
 
 [features]
-default = ["rabbitmq"]
+default = ["rabbitmq", "rustls"]
 rabbitmq = ["dep:queuey-rabbitmq"]
+# TLS for `amqps://`, forwarded to queuey-rabbitmq. Each one implies `rabbitmq`.
+rustls = ["rabbitmq", "queuey-rabbitmq/rustls"]
+rustls-aws-lc-rs = ["rabbitmq", "queuey-rabbitmq/rustls-aws-lc-rs"]
+rustls-ring = ["rabbitmq", "queuey-rabbitmq/rustls-ring"]
+rustls-platform-verifier = ["rabbitmq", "queuey-rabbitmq/rustls-platform-verifier"]
+rustls-native-certs = ["rabbitmq", "queuey-rabbitmq/rustls-native-certs"]
+rustls-webpki-roots = ["rabbitmq", "queuey-rabbitmq/rustls-webpki-roots"]
+native-tls = ["rabbitmq", "queuey-rabbitmq/native-tls"]
+openssl = ["rabbitmq", "queuey-rabbitmq/openssl"]
+openssl-vendored = ["rabbitmq", "queuey-rabbitmq/openssl-vendored"]
 
 [dependencies]
 queuey-core.workspace = true

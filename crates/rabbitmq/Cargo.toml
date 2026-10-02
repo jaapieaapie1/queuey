@@ -10,6 +10,26 @@ keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
 
+# TLS for `amqps://`. The names are this crate's own, not lapin's, so a lapin
+# major that renames its features stays a patch release here. See the README's
+# "TLS" section for which combinations make sense.
+[features]
+default = ["rustls"]
+# rustls with aws-lc-rs and the platform verifier: what lapin ships by default.
+rustls = ["rustls-aws-lc-rs", "rustls-platform-verifier"]
+# rustls crypto providers.
+rustls-aws-lc-rs = ["lapin/rustls--aws_lc_rs"]
+rustls-ring = ["lapin/rustls--ring"]
+# rustls trust roots.
+rustls-platform-verifier = ["lapin/rustls-platform-verifier"]
+rustls-native-certs = ["lapin/rustls-native-certs"]
+rustls-webpki-roots = ["lapin/rustls-webpki-roots-certs"]
+# The platform TLS library (Secure Transport, SChannel, OpenSSL).
+native-tls = ["lapin/native-tls"]
+# OpenSSL, linked from the system or built from source.
+openssl = ["lapin/openssl"]
+openssl-vendored = ["openssl", "lapin/vendored-openssl"]
+
 [dependencies]
 queuey-core.workspace = true
 async-trait.workspace = true

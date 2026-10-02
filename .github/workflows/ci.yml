@@ -58,6 +58,30 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # Every TLS feature has to build on its own, and the `amqps://` guard has to
+  # hold in a build without any of them. `openssl-vendored` is left out: it
+  # compiles OpenSSL from source and adds nothing `openssl` does not already
+  # cover for the Rust side.
+  tls-features:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - rustls-ring,rustls-webpki-roots
+          - rustls-aws-lc-rs,rustls-native-certs
+          - rustls-platform-verifier
+          - native-tls
+          - openssl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p queuey-rabbitmq --all-targets --no-default-features --features "${{ matrix.features }}" -- -D warnings
+      - run: cargo test -p queuey-rabbitmq --lib --no-default-features --features "${{ matrix.features }}"
+
   # The MSRV is a published promise (`rust-version = "1.88"`), so compile with
   # exactly that compiler. `rust-toolchain.toml` pins `channel = "stable"` and
   # rustup obeys that file over whatever a toolchain action makes default;

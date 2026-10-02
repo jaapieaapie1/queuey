@@ -35,9 +35,21 @@ code that names the `serde` crate, even when imported through the prelude.
 | feature | default | effect |
 |---|---|---|
 | `rabbitmq` | yes | pulls in `queuey-rabbitmq` and re-exports `RabbitMqBackend`, `RabbitMqOptions` and the `rabbitmq` module |
+| `rustls` | yes | TLS for `amqps://`: rustls on aws-lc-rs, trusting the platform verifier |
+| `rustls-aws-lc-rs`, `rustls-ring` | no | a rustls crypto provider |
+| `rustls-platform-verifier`, `rustls-native-certs`, `rustls-webpki-roots` | no | a rustls trust-root source |
+| `native-tls`, `openssl`, `openssl-vendored` | no | a TLS backend other than rustls |
 
-`default-features = false` leaves the core, the macros and `MemoryBackend`, which is
-enough for tests or for a backend of your own.
+Every TLS feature implies `rabbitmq`. `default-features = false` leaves the core, the
+macros and `MemoryBackend`, which is enough for tests or for a backend of your own.
+A service that only connects over `amqp://` can keep the broker and drop TLS:
+
+```toml
+queuey = { version = "1.1", default-features = false, features = ["rabbitmq"] }
+```
+
+Such a build refuses `amqps://` URIs rather than connecting without encryption. The
+[`queuey-rabbitmq` README](../rabbitmq/README.md#tls) covers which TLS features combine.
 
 ## Quickstart
 

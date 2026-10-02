@@ -33,7 +33,10 @@ use std::{
     time::Duration,
 };
 
-use lapin::{Channel, Connection};
+use lapin::{
+    Channel, Connection,
+    uri::{AMQPScheme, AMQPUri},
+};
 use queuey_core::{QueueConfig, Result};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error, info, warn};
@@ -47,6 +50,39 @@ use crate::{
 
 /// AMQP reply code for a normal, operator-initiated close.
 pub(crate) const REPLY_SUCCESS: u16 = 200;
+
+/// Whether this build can open a TLS connection at all.
+///
+/// Every `rustls-*` feature pulls in the rustls transport; the crypto provider
+/// and trust-root features only differ in how it is set up.
+const TLS_BACKEND: bool = cfg!(any(
+    feature = "rustls-aws-lc-rs",
+    feature = "rustls-ring",
+    feature = "rustls-platform-verifier",
+    feature = "rustls-native-certs",
+    feature = "rustls-webpki-roots",
+    feature = "native-tls",
+    feature = "openssl",
+));
+
+/// Refuse an `amqps://` URI when no TLS backend is compiled in.
+///
+/// Without a backend, the transport under `lapin` downgrades `amqps://` to a
+/// plaintext connection instead of failing, so this has to be caught here. A
+/// URI that does not parse is let through: `lapin` reports that with a better
+/// message than this crate could.
+fn require_tls_backend(uri: &str) -> Result<()> {
+    if TLS_BACKEND {
+        return Ok(());
+    }
+
+    match uri.parse::<AMQPUri>() {
+        Ok(parsed) if parsed.scheme == AMQPScheme::AMQPS => {
+            Err(RabbitMqError::TlsUnavailable.into_core())
+        }
+        _ => Ok(()),
+    }
+}
 
 /// A connection that replaces itself when the broker goes away.
 ///
@@ -101,6 +137,10 @@ impl ConnectionHandle {
     /// loop while whoever called `connect().await` waits. Reconnection covers
     /// the connections after this one, which nobody is awaiting.
     pub(crate) async fn connect(uri: &str, options: Arc<RabbitMqOptions>) -> Result<Arc<Self>> {
+        // Checked once: the URI never changes, so every reconnect dials the
+        // same scheme this call has already vetted.
+        require_tls_backend(uri)?;
+
         let connection = Connection::connect(uri, options.handshake_properties())
             .await
             .map_err(amqp)?;
@@ -480,4 +520,31 @@ pub(crate) async fn declare_topology(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_amqp_needs_no_tls_backend() {
+        require_tls_backend("amqp://guest:guest@localhost:5672/%2f").unwrap();
+    }
+
+    #[test]
+    fn amqps_is_refused_exactly_when_no_tls_backend_is_compiled_in() {
+        let result = require_tls_backend("amqps://guest:guest@localhost:5671/%2f");
+
+        if TLS_BACKEND {
+            result.unwrap();
+        } else {
+            let err = result.expect_err("amqps:// must not fall back to plaintext");
+            assert!(err.to_string().contains("needs a TLS backend"), "got {err}");
+        }
+    }
+
+    #[test]
+    fn unparseable_uris_are_left_for_lapin_to_report() {
+        require_tls_backend("not a uri").unwrap();
+    }
 }

@@ -7,6 +7,48 @@ number and are released together.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and from
 1.0.0 the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-10-02
+
+### Upgrading
+
+- **A default build is unaffected**: `queuey = "1"` and `queuey-rabbitmq = "1"` still
+  connect to `amqps://` exactly as 1.0.0 did.
+- **A build with `default-features = false` loses TLS.** In 1.0.0, `lapin`'s own
+  defaults always pulled in rustls, so `queuey = { version = "1", default-features =
+  false, features = ["rabbitmq"] }` could still dial `amqps://`. From 1.1.0 that build
+  has no TLS stack and `connect` fails on an `amqps://` URI with an error naming the
+  feature to enable. To keep TLS, add `"rustls"` (or another TLS feature) to the
+  feature list. A service that only speaks `amqp://` needs no change and now builds
+  without rustls and aws-lc-rs.
+- This is shipped as a minor release because no public item changed and the only
+  affected configuration fails loudly at connect rather than silently. Strictly, it
+  removes dependency features from a `default-features = false` build, which Cargo's
+  SemVer guide counts as *possibly* breaking: check the feature list before updating
+  if you connect over `amqps://`.
+
+### Added
+
+- **TLS features.** `queuey-rabbitmq` and the `queuey` facade choose the TLS stack for
+  `amqps://` through their own features: `rustls` (default), the rustls crypto providers
+  `rustls-aws-lc-rs` and `rustls-ring`, the trust-root sources
+  `rustls-platform-verifier`, `rustls-native-certs` and `rustls-webpki-roots`, and the
+  alternatives `native-tls`, `openssl` and `openssl-vendored`. The names are this
+  crate's own, so they stay stable across `lapin` majors.
+
+### Changed
+
+- `lapin` is now pulled in without its default features. The defaults of both crates
+  still enable `rustls`, so nothing changes for a default build. A build with
+  `default-features = false` (for the facade: `features = ["rabbitmq"]` alone) no longer
+  links a TLS stack, and with it rustls, aws-lc-rs and the macOS Security framework.
+  Add `rustls` to keep `amqps://`.
+
+### Security
+
+- Connecting to an `amqps://` URI without a TLS backend compiled in now fails with an
+  error that names the feature to enable. The transport underneath `lapin` would
+  otherwise open a plaintext connection to the same host, credentials included.
+
 ## [1.0.0] - 2026-09-16
 
 First stable release. The semantics have not moved since 0.3.0; what changed is that
